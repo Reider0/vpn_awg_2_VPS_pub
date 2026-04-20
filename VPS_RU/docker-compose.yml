@@ -1,0 +1,88 @@
+# Создаем статичную сеть для решения проблемы резолва DNS при network_mode
+networks:
+  vpn_net:
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+services:
+  # ---------------- POSTGRES ----------------
+  postgres:
+    image: postgres:15
+    container_name: vpn_db
+    restart: always
+    networks:
+      vpn_net:
+        ipv4_address: 172.20.0.5
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./volumes/database:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------- AMNEZIA WG (MASTER) ----------------
+  ru_wireguard:
+    build: ./ru_wg_api
+    container_name: vpn_wireguard
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    networks:
+      vpn_net:
+        ipv4_address: 172.20.0.6
+    environment:
+      SERVERPORT: 51820
+      INTERNAL_SUBNET: 10.13.13.0
+    volumes:
+      - ./volumes/wireguard:/etc/amnezia/amneziawg
+      - /lib/modules:/lib/modules
+    ports:
+      - "51820:51820/udp"
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ---------------- BOT (FRONTEND) ----------------
+  vpn_bot:
+    build: ./bot
+    container_name: vpn_bot
+    # Бот делит сеть с WireGuard для обхода блокировок Telegram
+    network_mode: "service:ru_wireguard"
+    depends_on:
+      - postgres
+      - ru_wireguard
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ADMIN_ID: ${ADMIN_ID}
+      # Обращаемся к БД по жесткому IP, так как DNS Docker'а недоступен в network_mode
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@172.20.0.5:5432/${POSTGRES_DB}
+      GIT_REPO: ${GIT_REPO}
+      GIT_USERNAME: ${GIT_USERNAME}
+      GIT_TOKEN: ${GIT_TOKEN}
+      WG_API_URL: http://127.0.0.1:8000/api
+      # IP адрес агента в Германии внутри туннеля
+      DE_AGENT_URL: http://10.13.13.254:8000/api
+    volumes:
+      - ./volumes:/volumes
+      - ./VERSION:/app/VERSION_FILE:ro
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

@@ -1,0 +1,27 @@
+services:
+  de_wireguard:
+    build: ./de_agent_api
+    container_name: de_vpn_agent
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - SERVERPORT=51820
+      - INTERNAL_SUBNET=10.13.13.0
+    volumes:
+      - ./volumes/wireguard:/etc/amnezia/amneziawg
+      - ./volumes/flags:/volumes/flags
+      - /:/hostfs:ro
+      - /lib/modules:/lib/modules
+    ports:
+      - "51820:51820/udp"
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

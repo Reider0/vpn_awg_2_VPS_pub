@@ -1,0 +1,9 @@
+python-telegram-bot==20.7
+asyncpg
+psutil
+qrcode
+pillow
+matplotlib
+pandas
+openpyxl
+aiohttp
