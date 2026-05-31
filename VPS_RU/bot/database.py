@@ -86,8 +86,27 @@ class Database:
             if not res_last:
                 await self.execute("ALTER TABLE users ADD COLUMN last_active_at TIMESTAMP;")
 
+            # routing_version: формат маршрутизации конфига. 0 = старый (полный туннель,
+            # без обхода дата-центро-враждебных РФ-сервисов). Новые/перевыпущенные ключи
+            # получают актуальную версию. Старые ключи остаются на 0 и работают как раньше.
+            res_rv = await self.fetch_all("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='routing_version';")
+            if not res_rv:
+                await self.execute("ALTER TABLE users ADD COLUMN routing_version INTEGER DEFAULT 0;")
+
         except Exception as e:
             print(f"Migration error: {e}")
+
+    async def get_outdated_keys(self, current_version):
+        """Ключи со старым форматом маршрутизации, у которых есть привязка Telegram —
+        для ежедневного напоминания «перевыпусти конфиг»."""
+        query = """
+            SELECT u.uuid, u.name, ARRAY_REMOVE(ARRAY_AGG(l.tg_id), NULL) as tg_ids
+            FROM users u
+            JOIN user_tg_links l ON u.uuid = l.uuid
+            WHERE COALESCE(u.routing_version, 0) < $1
+            GROUP BY u.uuid, u.name
+        """
+        return await self.fetch_all(query, current_version)
 
     async def track_user_ip(self, uuid, ip):
         existing = await self.fetch_val("SELECT status FROM user_ips WHERE uuid=$1 AND ip=$2", uuid, ip)

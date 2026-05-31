@@ -37,7 +37,9 @@ async def create_peer(name: str, dns_type: str = "classic"):
     qr_path = CONFIGS_DIR / f"{name}.png"
     
     with open(conf_path, "w") as f: f.write(config_full)
-    qrcode.make(config_full).save(qr_path)
+    # ECC=L даёт максимум вместимости: split-tunnel конфиг крупнее (исключения в
+    # AllowedIPs), и при ECC=M он может не влезть в сканируемый QR.
+    qrcode.make(config_full, error_correction=qrcode.constants.ERROR_CORRECT_L).save(qr_path)
     
     await backup_wg_config()
     

@@ -3,6 +3,7 @@ import os
 import shutil
 from database import db
 from wireguard_manager import create_peer
+from utils import ROUTING_VERSION
 
 async def main():
     print("Подключение к базе данных...")
@@ -16,7 +17,7 @@ async def main():
     print("⏳ Генерация ключа DE_AGENT через API...")
     try:
         new_uid, c_path, q_path = await create_peer("DE_AGENT", dns_type="classic")
-        await db.execute("INSERT INTO users (name, uuid, created_at) VALUES ($1, $2, NOW())", "DE_AGENT", new_uid)
+        await db.execute("INSERT INTO users (name, uuid, created_at, routing_version) VALUES ($1, $2, NOW(), $3)", "DE_AGENT", new_uid, ROUTING_VERSION)
         dest = "/volumes/DE_AGENT_CONFIG.txt"
         shutil.copy(c_path, dest)
         print(f"✅ Ключ DE_AGENT успешно создан и сохранен в {dest}.")

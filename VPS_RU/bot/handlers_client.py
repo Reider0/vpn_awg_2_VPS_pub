@@ -6,7 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
-from utils import escape_md, WG_API_URL, state_data, check_admin, CONFIGS_DIR, dt_to_moscow, ts_to_moscow, safe_delete
+from utils import escape_md, WG_API_URL, state_data, check_admin, CONFIGS_DIR, dt_to_moscow, ts_to_moscow, safe_delete, ROUTING_VERSION
 from database import db
 from wireguard_manager import create_peer, delete_peer
 
@@ -228,7 +228,7 @@ async def client_regen_all_action_handler(update: Update, context: ContextTypes.
         
         try:
             new_uid, c_path, q_path = await create_peer(name, dns_type="classic")
-            await db.execute("INSERT INTO users (name, uuid, created_at, expires_at) VALUES ($1, $2, NOW(), $3)", name, new_uid, exp_at)
+            await db.execute("INSERT INTO users (name, uuid, created_at, expires_at, routing_version) VALUES ($1, $2, NOW(), $3, $4)", name, new_uid, exp_at, ROUTING_VERSION)
             
             for tid in tg_ids:
                 await db.link_user_telegram(new_uid, tid)

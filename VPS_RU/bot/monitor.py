@@ -1,12 +1,50 @@
 import os
 import time
+import socket
+import ipaddress
 import psutil
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from database import db
-from utils import get_moscow_now, dt_to_moscow, broadcast_message, DE_AGENT_URL, WG_API_URL, ADMIN_ID, escape_md
+from utils import get_moscow_now, dt_to_moscow, broadcast_message, DE_AGENT_URL, WG_API_URL, ADMIN_ID, escape_md, ROUTING_VERSION
+
+# --- SPLIT-TUNNEL: дата-центро-враждебные РФ-сервисы (мимо VPN, через домашний канал) ---
+# ВАЖНО: держать в синхроне с BYPASS_CIDRS в ru_wg_api/api.py.
+BYPASS_DOMAINS = ["gosuslugi.ru", "www.gosuslugi.ru", "esia.gosuslugi.ru", "max.ru", "web.max.ru", "vseinstrumenti.ru"]
+BYPASS_CIDRS = ["213.59.252.0/22", "109.207.0.0/18", "155.212.204.0/24", "185.169.155.0/24"]
+
+UPGRADE_INSTRUCTION = (
+    "🔄 *Как обновить (новый ключ выдаётся автоматически):*\n"
+    "1️⃣ Нажми «Перевыпустить» ниже — бот пришлёт новый `.conf` и QR.\n"
+    "2️⃣ В приложении *AmneziaWG* удали старое подключение.\n"
+    "3️⃣ Добавь новое одним из способов:\n"
+    "   • *QR:* «＋» → «Сканировать QR-код» → наведи на новый QR;\n"
+    "   • *Файл:* «＋» → «Импорт из файла» → выбери новый `.conf`.\n"
+    "4️⃣ Включи VPN. Готово — Госуслуги, MAX и банки заработают."
+)
+
+def _check_bypass_drift():
+    """Синхронно: резолвит проблемные домены и проверяет, что их IP всё ещё внутри
+    BYPASS_CIDRS. Возвращает список 'ушедших' адресов (drift)."""
+    nets = [ipaddress.ip_network(c) for c in BYPASS_CIDRS]
+    drifted = []
+    for d in BYPASS_DOMAINS:
+        try:
+            infos = socket.getaddrinfo(d, 443, socket.AF_INET)
+            ips = sorted({i[4][0] for i in infos})
+        except Exception:
+            continue
+        for ip in ips:
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if not any(addr in n for n in nets):
+                drifted.append(f"{d} → {ip}")
+    return drifted
 
 notified_cache = set()
 last_ip_cache = {}
@@ -46,6 +84,12 @@ async def get_dashboard():
     except Exception:
         pass
 
+    bypass_count = len(BYPASS_CIDRS)
+    try:
+        outdated_count = len(await db.get_outdated_keys(ROUTING_VERSION))
+    except Exception:
+        outdated_count = 0
+
     return (
         f"📊 **Дашборд Системы**\n\n"
         f"🇷🇺 **RU Сервер (Master)**\n"
@@ -54,7 +98,9 @@ async def get_dashboard():
         f"Диск:  {disk_ru}%\n\n"
         f"🇩🇪 **DE Сервер (Agent)**\n"
         f"{de_status_text}\n\n"
-        f"🔌 **Активных VPN сессий:** {peers_text}"
+        f"🔌 **Активных VPN сессий:** {peers_text}\n"
+        f"🚫 **Not-allow addr (мимо VPN):** {bypass_count} диап.\n"
+        f"♻️ **Ключей на старом формате:** {outdated_count}"
     )
 
 # ------------------------ СИСТЕМНЫЕ АЛЕРТЫ ------------------------
@@ -428,3 +474,98 @@ async def scheduled_update_loop(app):
                     with open("/volumes/flags/do_update", "w") as f: f.write("update_requested")
         except Exception as e: pass
         await asyncio.sleep(60)
+
+# ------------------------ ROUTING UPGRADE (split-tunnel напоминания) ------------------------
+async def routing_upgrade_loop(app):
+    """Ежедневно в 8:00 МСК напоминает владельцам устаревших ключей перевыпустить конфиг
+    (чтобы заработали Госуслуги/MAX/банки) — по КАЖДОМУ ключу отдельно, пока не обновят.
+    Заодно раз в день проверяет дрейф bypass-IP и алертит админа."""
+    while True:
+        now_msk = get_moscow_now()
+        if now_msk.hour == 8:
+            today = now_msk.strftime("%Y-%m-%d")
+            try:
+                if await db.get_setting("last_routing_notice") != today:
+                    await db.set_setting("last_routing_notice", today)
+                    await _send_upgrade_notices(app)
+                    await _run_drift_alert(app)
+            except Exception as e:
+                print(f"Routing upgrade loop error: {e}")
+            await asyncio.sleep(3600)
+        else:
+            await asyncio.sleep(600)
+
+async def _send_upgrade_notices(app):
+    outdated = await db.get_outdated_keys(ROUTING_VERSION)
+    sent = 0
+    for k in outdated:
+        name = escape_md(k['name'])
+        text = (
+            f"🔔 **Обновите конфиг ключа «{name}»**\n\n"
+            "Хотите, чтобы **Госуслуги**, мессенджер **MAX**, банки и подобные сайты "
+            "работали через VPN? Перевыпустите этот конфиг. Старый продолжит работать "
+            "как прежде, но без обхода этих сервисов.\n\n" + UPGRADE_INSTRUCTION
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Перевыпустить этот ключ", callback_data=f"client_regen_{k['uuid']}")],
+            [InlineKeyboardButton("🏠 Личный кабинет", callback_data="client_menu")],
+        ])
+        for tid in k.get('tg_ids', []):
+            try:
+                await app.bot.send_message(chat_id=tid, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+                sent += 1
+            except Exception:
+                pass
+    if sent:
+        await db.log_event("Routing", f"Daily upgrade notice sent ({sent} msg).")
+    return sent
+
+async def _run_drift_alert(app):
+    drifted = await asyncio.to_thread(_check_bypass_drift)
+    if drifted and ADMIN_ID:
+        msg = ("⚠️ **Дрейф bypass-адресов!**\n\nIP проблемных сайтов вышли за пределы "
+               "BYPASS\\_CIDRS — обнови списки в `ru_wg_api/api.py` и `bot/monitor.py`:\n\n" +
+               "\n".join(f"• `{d}`" for d in drifted))
+        try:
+            await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+        await db.log_event("Routing", f"Bypass drift detected: {len(drifted)} entries.")
+    return drifted
+
+# --- Ручной запуск из админки ---
+async def run_bypass_check_handler(update, context):
+    query = update.callback_query
+    await query.answer("Проверяю bypass-адреса...")
+    try:
+        drifted = await asyncio.to_thread(_check_bypass_drift)
+        outdated = await db.get_outdated_keys(ROUTING_VERSION)
+    except Exception as e:
+        await query.edit_message_text(f"❌ Ошибка проверки: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]))
+        return
+
+    lines = [
+        "🛡 **Проверка split-tunnel (bypass)**\n",
+        f"🚫 Bypass-диапазонов (мимо VPN): **{len(BYPASS_CIDRS)}**",
+        f"♻️ Ключей на старом формате: **{len(outdated)}**\n",
+    ]
+    if drifted:
+        lines.append("⚠️ **Дрейф IP — обнови списки в коде:**")
+        lines += [f"• `{d}`" for d in drifted]
+    else:
+        lines.append("✅ Все проблемные сайты в пределах bypass-диапазонов.")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📨 Разослать напоминания сейчас", callback_data="bypass_notify_now")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")],
+    ])
+    await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+async def bypass_notify_now_handler(update, context):
+    query = update.callback_query
+    await query.answer("Рассылаю напоминания...")
+    sent = await _send_upgrade_notices(context.application)
+    await query.edit_message_text(
+        f"✅ Напоминания разосланы по устаревшим ключам (сообщений: {sent}).",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]])
+    )

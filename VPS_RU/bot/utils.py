@@ -10,6 +10,11 @@ from datetime import datetime, timedelta
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
+# Версия формата маршрутизации конфига. Должна совпадать с ROUTING_VERSION в
+# ru_wg_api/api.py. Ключи с меньшей версией считаются устаревшими (полный туннель,
+# без обхода дата-центро-враждебных РФ-сервисов) — им шлём ежедневное напоминание.
+ROUTING_VERSION = 1
+
 VERSION_FILE = "/app/VERSION_FILE"
 BACKUP_FILE = "/volumes/backups/backup_latest.tar.gz"
 GIT_REPO = os.getenv("GIT_REPO", "") 

@@ -17,9 +17,10 @@ from utils import (
 from database import db
 from ui import main_menu
 from monitor import (
-    alert_loop, cleanup_peers, stats_collector_loop, self_healing_loop, 
-    expiration_loop, inactivity_loop, weekly_report_loop, log_cleanup_loop, 
-    auto_reboot_loop, scheduled_update_loop, resource_monitor_loop
+    alert_loop, cleanup_peers, stats_collector_loop, self_healing_loop,
+    expiration_loop, inactivity_loop, weekly_report_loop, log_cleanup_loop,
+    auto_reboot_loop, scheduled_update_loop, resource_monitor_loop,
+    routing_upgrade_loop, run_bypass_check_handler, bypass_notify_now_handler
 )
 from wireguard_manager import pause_peer, resume_peer
 
@@ -486,8 +487,9 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "gen_key": generate_key_request, "vpn_graph": send_vpn_graph,
         "show_online": online_users_menu, "backup": backup_now, 
         "download_logs": download_logs, "restore": restore_cmd, 
-        "check_update": check_update, "do_update": do_update, 
-        "show_users": lambda u, c: users_list_menu(u, c, 0), "export_excel": export_excel
+        "check_update": check_update, "do_update": do_update,
+        "show_users": lambda u, c: users_list_menu(u, c, 0), "export_excel": export_excel,
+        "run_bypass_check": run_bypass_check_handler, "bypass_notify_now": bypass_notify_now_handler
     }
     
     if data in actions: await actions[data](update, context)
@@ -512,7 +514,8 @@ async def post_init(application):
         asyncio.create_task(auto_backup_loop(application)),
         asyncio.create_task(auto_reboot_loop(application)),
         asyncio.create_task(scheduled_update_loop(application)),
-        asyncio.create_task(resource_monitor_loop(application))
+        asyncio.create_task(resource_monitor_loop(application)),
+        asyncio.create_task(routing_upgrade_loop(application))
     ]
     state_data["bg_tasks"].update(tasks)
 

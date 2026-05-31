@@ -6,7 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
-from utils import escape_md, stop_bg_tasks, deregister_menu, ADMIN_ID, CONFIGS_DIR, WG_API_URL, dt_to_moscow
+from utils import escape_md, stop_bg_tasks, deregister_menu, ADMIN_ID, CONFIGS_DIR, WG_API_URL, dt_to_moscow, ROUTING_VERSION
 from database import db
 from wireguard_manager import create_peer, delete_peer, pause_peer, resume_peer
 from handlers_client import send_client_menu
@@ -230,7 +230,7 @@ async def finish_key_creation(update: Update, context: ContextTypes.DEFAULT_TYPE
         new_uid, c_path, q_path = await create_peer(name, dns_type=dns_type)
         expires_at = datetime.utcnow() + timedelta(days=exp_days) if exp_days > 0 else None
         
-        await db.execute("INSERT INTO users (name, uuid, created_at, expires_at) VALUES ($1, $2, NOW(), $3) ON CONFLICT (uuid) DO NOTHING", name, new_uid, expires_at)
+        await db.execute("INSERT INTO users (name, uuid, created_at, expires_at, routing_version) VALUES ($1, $2, NOW(), $3, $4) ON CONFLICT (uuid) DO NOTHING", name, new_uid, expires_at, ROUTING_VERSION)
         await db.log_event("Create Key", f"Created key {name}. Expiry: {exp_days} days. DNS: {dns_type}")
         
         if tg_id: await db.link_user_telegram(new_uid, tg_id)

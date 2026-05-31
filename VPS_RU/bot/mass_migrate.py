@@ -6,7 +6,7 @@ import aiohttp
 from telegram.ext import ApplicationBuilder
 from database import db
 from wireguard_manager import create_peer
-from utils import BOT_TOKEN
+from utils import BOT_TOKEN, ROUTING_VERSION
 
 ARCHIVE_PATH = "/volumes/backups/old_bkp.tar.gz"
 DUMP_EXTRACT_PATH = "/tmp/old_db_dump.sql"
@@ -132,7 +132,7 @@ async def main():
         try:
             # Создаем в рабочей среде
             new_uid, c_path, q_path = await create_peer(name, dns_type="classic")
-            await db.execute("INSERT INTO users (name, uuid, created_at, expires_at) VALUES ($1, $2, NOW(), $3)", name, new_uid, exp_at)
+            await db.execute("INSERT INTO users (name, uuid, created_at, expires_at, routing_version) VALUES ($1, $2, NOW(), $3, $4)", name, new_uid, exp_at, ROUTING_VERSION)
             
             for tid in tg_ids:
                 await db.link_user_telegram(new_uid, tid)

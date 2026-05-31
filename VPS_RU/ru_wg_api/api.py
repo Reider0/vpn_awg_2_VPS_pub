@@ -4,6 +4,7 @@ import subprocess
 import urllib.request
 import re
 import time
+import ipaddress
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -30,6 +31,39 @@ OBFUSCATION_PARAMS = (
     "H3 = 3\n"
     "H4 = 4\n"
 )
+
+# --- SPLIT-TUNNEL: дата-центро-враждебные РФ-сервисы ---
+# Эти сервисы блокируют IP хостинга/дата-центра (а сервер — это VPS), поэтому через
+# туннель они не работают. Их диапазоны ИСКЛЮЧАЮТСЯ из AllowedIPs нового конфига →
+# клиент ходит на них через своё домашнее подключение (резидентский IP) → они снова
+# работают. Список держим КОМПАКТНЫМ: каждый диапазон раздувает AllowedIPs и QR.
+# routing_version в боте должен совпадать с ROUTING_VERSION ниже.
+ROUTING_VERSION = 1
+BYPASS_CIDRS = [
+    "213.59.252.0/22",   # gosuslugi.ru
+    "109.207.0.0/18",    # www / esia.gosuslugi.ru
+    "155.212.204.0/24",  # MAX (max.ru)
+    "185.169.155.0/24",  # vseinstrumenti.ru
+]
+
+def build_split_allowed_ips():
+    """AllowedIPs = весь IPv4 МИНУС bypass-диапазоны, плюс ::/0.
+    Клиент гонит в туннель всё, кроме проблемных РФ-сервисов (они идут напрямую)."""
+    nets = [ipaddress.ip_network("0.0.0.0/0")]
+    for cidr in BYPASS_CIDRS:
+        try:
+            ex = ipaddress.ip_network(cidr)
+        except ValueError:
+            continue
+        rebuilt = []
+        for n in nets:
+            if not n.overlaps(ex):
+                rebuilt.append(n)
+            elif ex.subnet_of(n):
+                rebuilt.extend(n.address_exclude(ex))
+            # иначе n целиком внутри ex — выкидываем
+        nets = rebuilt
+    return ", ".join(str(n) for n in nets) + ", ::/0"
 
 if not os.path.exists(CONF_DIR):
     os.makedirs(CONF_DIR, exist_ok=True)
@@ -325,7 +359,7 @@ def create_peer(req: PeerCreate):
 
         target_dns = "94.140.14.14, 94.140.15.15" if req.dns_type == "adblock" else "1.1.1.1, 1.0.0.1"
 
-        client_allowed_ips = "10.13.13.0/24" if is_de_agent else "0.0.0.0/0, ::/0"
+        client_allowed_ips = "10.13.13.0/24" if is_de_agent else build_split_allowed_ips()
 
         server_allowed_ips = "0.0.0.0/0, 10.13.13.254/32" if is_de_agent else f"{client_ip}/32"
 
