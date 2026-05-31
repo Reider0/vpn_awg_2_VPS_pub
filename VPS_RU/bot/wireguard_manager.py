@@ -29,8 +29,10 @@ async def create_peer(name: str, dns_type: str = "classic"):
             data = await resp.json()
 
     uid = data["uid"]
-    config_full = data["config"]
-    
+    # Нормализуем: конфиг должен начинаться строго с [Interface] (без пустой строки),
+    # иначе строгий парсер AmneziaWG считает файл некорректным.
+    config_full = data["config"].strip() + "\n"
+
     conf_path = CONFIGS_DIR / f"{name}.conf"
     qr_path = CONFIGS_DIR / f"{name}.png"
     

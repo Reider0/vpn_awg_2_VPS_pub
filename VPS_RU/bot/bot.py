@@ -11,8 +11,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 from telegram.constants import ParseMode
 
 from utils import (
-    BOT_TOKEN, ADMIN_ID, WG_API_URL, DE_AGENT_URL, escape_md, state_data, stop_bg_tasks, deregister_menu, 
-    safe_delete, get_current_version, broadcast_message, extract_tg_id, check_admin
+    BOT_TOKEN, ADMIN_ID, WG_API_URL, DE_AGENT_URL, escape_md, state_data, stop_bg_tasks, deregister_menu,
+    safe_delete, get_current_version, broadcast_message, extract_tg_id, check_admin, sanitize_name
 )
 from database import db
 from ui import main_menu
@@ -294,7 +294,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state == "awaiting_name":
-        name = update.message.text.strip().replace(" ", "_")
+        # Транслит рус->лат + обрезка эмодзи, чтобы имя приняло приложение AmneziaWG
+        name = sanitize_name(update.message.text)
         context.user_data["name"] = name
         menu_id = context.user_data.get("menu_msg_id")
         

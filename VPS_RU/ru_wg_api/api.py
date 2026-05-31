@@ -151,10 +151,23 @@ def setup_network():
     # 3. ИСКЛЮЧЕНИЕ ПЕТЛИ 2: Зашифрованный трафик самого WireGuard идет мимо туннеля
     run_cmd("iptables -t mangle -A OUTPUT -p udp --sport 51820 -j RETURN")
     run_cmd("iptables -t mangle -A OUTPUT -p udp --dport 51820 -j RETURN")
-    
+
+    # Гарантируем существование наборов (наполняются скриптом update_ru_ips.sh):
+    #   ru_nets      — гео-IP РФ (идут напрямую)
+    #   blocked_nets — блокировки РКН (antifilter, принудительно в Германию)
+    subprocess.run("ipset create ru_nets hash:net family inet hashsize 4096 maxelem 1000000 -exist", shell=True, stderr=subprocess.DEVNULL)
+    subprocess.run("ipset create blocked_nets hash:net family inet hashsize 4096 maxelem 1000000 -exist", shell=True, stderr=subprocess.DEVNULL)
+
+    # 3.5 ПРИНУДИТЕЛЬНЫЙ ОБХОД: заблокированные РКН ресурсы всегда уходят в Германию,
+    #     даже если они размещены на российских IP (повышает качество обхода блокировок).
+    #     Делаем НЕфатально: если blocked_nets недоступен, узел всё равно поднимется
+    #     на базовой гео-логике, а не уйдёт в полный отказ.
+    subprocess.run("iptables -t mangle -A PREROUTING -i wg0 -m set --match-set blocked_nets dst -j MARK --set-mark 200", shell=True, stderr=subprocess.DEVNULL)
+    subprocess.run("iptables -t mangle -A OUTPUT -m set --match-set blocked_nets dst -j MARK --set-mark 200", shell=True, stderr=subprocess.DEVNULL)
+
     # 4. Маркируем трафик клиентов (VPN) для отправки в Германию, если это не РУ-сегмент
     run_cmd("iptables -t mangle -A PREROUTING -i wg0 -m set ! --match-set ru_nets dst -j MARK --set-mark 200")
-    
+
     # 5. Маркируем локальный трафик бота (который живет в одной сети с API)
     run_cmd("iptables -t mangle -A OUTPUT -m set ! --match-set ru_nets dst -j MARK --set-mark 200")
     

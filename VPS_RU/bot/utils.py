@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from pathlib import Path
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -55,6 +56,41 @@ def check_admin(user_id):
 def escape_md(text: str) -> str:
     if not text: return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+
+# Карта транслитерации кириллицы (для имён тоннелей AmneziaWG)
+_TRANSLIT_MAP = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+    'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+    'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+    'і': 'i', 'ї': 'yi', 'є': 'e', 'ґ': 'g',
+}
+
+def sanitize_name(raw: str, fallback: str = "user") -> str:
+    """Делает имя ключа безопасным для имени тоннеля AmneziaWG/WireGuard.
+
+    Приложение AmneziaWG принимает только имена вида [A-Za-z0-9_=+.-] длиной
+    до 15 символов и ругается «неверно задано поле имя» на кириллицу/эмодзи.
+    Здесь: кириллица -> латиница (транслит), эмодзи/символы -> отбрасываются,
+    пробелы -> '_'. Регистр латиницы сохраняется ('Иван' -> 'Ivan').
+    """
+    if not raw:
+        return fallback
+    out = []
+    for ch in raw.strip():
+        low = ch.lower()
+        if low in _TRANSLIT_MAP:
+            t = _TRANSLIT_MAP[low]
+            out.append(t.upper() if ch.isupper() else t)
+        elif ch.isascii() and ch.isalnum():
+            out.append(ch)
+        elif ch in ' _-.':
+            out.append('_')
+        # всё прочее (эмодзи, иероглифы, спецсимволы) — отбрасываем
+    name = re.sub(r'_+', '_', ''.join(out)).strip('_-.')
+    name = name[:15].strip('_-.')
+    return name or fallback
 
 async def extract_tg_id(message, context):
     if not message: return None
