@@ -156,9 +156,10 @@ def get_update_info():
             "git init && "
             f"git remote add origin '{auth_repo_url}' && "
             "git config core.sparseCheckout true && "
+            "echo 'VPS_RU/VERSION' >> .git/info/sparse-checkout && "
             "echo 'VERSION' >> .git/info/sparse-checkout && "
             "(git pull --depth=1 origin main >/dev/null 2>&1 || git pull --depth=1 origin master >/dev/null 2>&1) && "
-            "cat VERSION"
+            "(cat VPS_RU/VERSION 2>/dev/null || cat VERSION 2>/dev/null)"
         )
         output_ver = subprocess.check_output(cmd_ver, shell=True, stderr=subprocess.STDOUT, env=env, timeout=30).decode().strip()
         if output_ver:
