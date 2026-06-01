@@ -498,6 +498,15 @@ vpn_awg_2_VPS/
 
 ## 🩹 Патчи
 
+### v4.6.2 — Устойчивая сборка при медленном pypi
+
+Сборка образов падала на флапающем доступе к `pypi.org` (`ReadTimeoutError`, дефолтный per-read таймаут pip = 15с) — частая беда РФ-хостингов. Теперь оба `Dockerfile` ставят зависимости с `--timeout 120 --retries 10`, а через build-arg можно указать зеркало:
+
+```bash
+docker compose build --build-arg PIP_INDEX_URL=https://mirror.yandex.ru/mirrors/pypi/simple/
+docker compose up -d
+```
+
 ### v4.6.1 — Персональное отключение напоминаний
 
 Не всем нужны напоминания о смене политик — добавлена возможность **самостоятельно отключить спам**.
