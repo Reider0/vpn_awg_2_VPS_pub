@@ -5,6 +5,7 @@ import urllib.request
 import re
 import time
 import ipaddress
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -38,6 +39,9 @@ OBFUSCATION_PARAMS = (
 # клиент ходит на них через своё домашнее подключение (резидентский IP) → они снова
 # работают. Список держим КОМПАКТНЫМ: каждый диапазон раздувает AllowedIPs и QR.
 # routing_version в боте должен совпадать с ROUTING_VERSION ниже.
+# ВАЖНО: фактический список исключений приходит от бота в запросе POST /peers
+# (поле bypass_cidrs) — источник правды это БД бота (таблица bypass_exclusions).
+# BYPASS_CIDRS ниже — лишь аварийный фолбэк, если бот ничего не передал.
 ROUTING_VERSION = 1
 BYPASS_CIDRS = [
     "213.59.252.0/22",   # gosuslugi.ru
@@ -46,11 +50,13 @@ BYPASS_CIDRS = [
     "185.169.155.0/24",  # vseinstrumenti.ru
 ]
 
-def build_split_allowed_ips():
+def build_split_allowed_ips(bypass_cidrs=None):
     """AllowedIPs = весь IPv4 МИНУС bypass-диапазоны, плюс ::/0.
-    Клиент гонит в туннель всё, кроме проблемных РФ-сервисов (они идут напрямую)."""
+    Клиент гонит в туннель всё, кроме проблемных РФ-сервисов (они идут напрямую).
+    bypass_cidrs — список из БД бота; при отсутствии используется фолбэк BYPASS_CIDRS."""
+    cidrs = bypass_cidrs if bypass_cidrs else BYPASS_CIDRS
     nets = [ipaddress.ip_network("0.0.0.0/0")]
-    for cidr in BYPASS_CIDRS:
+    for cidr in cidrs:
         try:
             ex = ipaddress.ip_network(cidr)
         except ValueError:
@@ -71,6 +77,7 @@ if not os.path.exists(CONF_DIR):
 class PeerCreate(BaseModel):
     name: str
     dns_type: str = "classic"
+    bypass_cidrs: Optional[List[str]] = None
 
 class BackupData(BaseModel):
     conf: str
@@ -359,7 +366,7 @@ def create_peer(req: PeerCreate):
 
         target_dns = "94.140.14.14, 94.140.15.15" if req.dns_type == "adblock" else "1.1.1.1, 1.0.0.1"
 
-        client_allowed_ips = "10.13.13.0/24" if is_de_agent else build_split_allowed_ips()
+        client_allowed_ips = "10.13.13.0/24" if is_de_agent else build_split_allowed_ips(req.bypass_cidrs)
 
         server_allowed_ips = "0.0.0.0/0, 10.13.13.254/32" if is_de_agent else f"{client_ip}/32"
 

@@ -1,7 +1,10 @@
 import os
 import re
+import socket
+import ipaddress
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from datetime import datetime, timedelta
@@ -10,10 +13,61 @@ from datetime import datetime, timedelta
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# Версия формата маршрутизации конфига. Должна совпадать с ROUTING_VERSION в
-# ru_wg_api/api.py. Ключи с меньшей версией считаются устаревшими (полный туннель,
-# без обхода дата-центро-враждебных РФ-сервисов) — им шлём ежедневное напоминание.
+# Базовая (минимальная) версия формата маршрутизации конфига. Фактическая «текущая»
+# версия живёт в БД (settings.routing_version) и поднимается при каждом изменении
+# списка split-tunnel исключений — тогда все ранее выданные ключи становятся
+# «устаревшими» и им уходит ежедневное напоминание о перевыпуске. Эта константа —
+# нижняя граница (на случай пустого settings) и точка синхронизации с api.py.
 ROUTING_VERSION = 1
+
+# --- SPLIT-TUNNEL: дата-центро-враждебные РФ-сервисы (обход мимо VPN) ---
+# Базовый список для ПЕРВИЧНОГО наполнения БД (таблица bypass_exclusions). Дальше
+# список живёт в БД и пополняется анализатором/админом. Каждая запись: домен,
+# подсети (через запятую), примечание.
+BASE_BYPASS = [
+    ("gosuslugi.ru", "213.59.252.0/22,109.207.0.0/18", "Госуслуги и ЕСИА (esia)"),
+    ("max.ru", "155.212.204.0/24", "Мессенджер MAX"),
+    ("vseinstrumenti.ru", "185.169.155.0/24", "ВсеИнструменты"),
+]
+
+# Предупреждение про приложения, которые блокируют VPN на уровне ядра телефона.
+GOSUSLUGI_APP_WARNING = (
+    "⚠️ *Важно про приложения Госуслуг/банков:*\n"
+    "Часть мобильных приложений (например, «Госуслуги») блокирует работу при включённом "
+    "VPN на уровне ядра телефона — через приложение они могут не открываться. "
+    "В этом случае пользуйтесь *версией в браузере* (она ходит напрямую через исключение), "
+    "либо временно отключайте VPN для такого приложения."
+)
+
+
+def analyze_resource(target: str):
+    """Резолвит домен/URL в список IPv4 и агрегирует их в /24-подсети для добавления
+    в split-tunnel исключения. Это БЛОКИРУЮЩАЯ операция (DNS) — вызывать через
+    asyncio.to_thread. Возвращает dict: {domain, ips, cidrs, error}."""
+    raw = (target or "").strip()
+    if not raw:
+        return {"domain": "", "ips": [], "cidrs": [], "error": "Пустой адрес"}
+
+    # Достаём хост из URL или принимаем «голый» домен (отрезаем путь/порт)
+    if "://" in raw:
+        host = urlparse(raw).hostname or ""
+    else:
+        host = raw.split("/")[0].split(":")[0]
+    host = (host or "").strip().lower().lstrip("@")
+    if not host:
+        return {"domain": "", "ips": [], "cidrs": [], "error": "Не удалось извлечь домен"}
+
+    try:
+        infos = socket.getaddrinfo(host, 443, socket.AF_INET)
+        ips = sorted({i[4][0] for i in infos})
+    except Exception as e:
+        return {"domain": host, "ips": [], "cidrs": [], "error": f"DNS не разрешился: {e}"}
+
+    if not ips:
+        return {"domain": host, "ips": [], "cidrs": [], "error": "Адрес не разрешился в IPv4"}
+
+    cidrs = sorted({str(ipaddress.ip_network(f"{ip}/24", strict=False)) for ip in ips})
+    return {"domain": host, "ips": ips, "cidrs": cidrs, "error": None}
 
 VERSION_FILE = "/app/VERSION_FILE"
 BACKUP_FILE = "/volumes/backups/backup_latest.tar.gz"

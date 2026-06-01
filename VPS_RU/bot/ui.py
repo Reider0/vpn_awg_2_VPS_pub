@@ -29,7 +29,8 @@ def menu_ru_server():
     keyboard = [
         [InlineKeyboardButton("🛠 Глобальный Аудит RU", callback_data="run_audit"),
          InlineKeyboardButton("🔄 Обновить систему", callback_data="check_update")],
-        [InlineKeyboardButton("🛡 Проверка bypass (split-tunnel)", callback_data="run_bypass_check")],
+        [InlineKeyboardButton("🌐 Исключения (split-tunnel)", callback_data="bypass_list"),
+         InlineKeyboardButton("🛡 Проверка bypass", callback_data="run_bypass_check")],
         [InlineKeyboardButton("🚨 Перезагрузить Сервер", callback_data="confirm_reboot")],
         [InlineKeyboardButton("⚠️ Режим Тех. Работ", callback_data="maintenance_warn")],
         [InlineKeyboardButton("🔙 Назад в главное меню", callback_data="back_to_main")]

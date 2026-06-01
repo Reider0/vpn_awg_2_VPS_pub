@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import socket
 import ipaddress
@@ -8,13 +9,17 @@ import aiohttp
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram import Update
+from telegram.ext import ContextTypes
 from database import db
-from utils import get_moscow_now, dt_to_moscow, broadcast_message, DE_AGENT_URL, WG_API_URL, ADMIN_ID, escape_md, ROUTING_VERSION
+from utils import (
+    get_moscow_now, dt_to_moscow, broadcast_message, DE_AGENT_URL, WG_API_URL,
+    ADMIN_ID, escape_md, GOSUSLUGI_APP_WARNING, analyze_resource, CONFIGS_DIR, ROUTING_VERSION
+)
 
 # --- SPLIT-TUNNEL: дата-центро-враждебные РФ-сервисы (мимо VPN, через домашний канал) ---
-# ВАЖНО: держать в синхроне с BYPASS_CIDRS в ru_wg_api/api.py.
-BYPASS_DOMAINS = ["gosuslugi.ru", "www.gosuslugi.ru", "esia.gosuslugi.ru", "max.ru", "web.max.ru", "vseinstrumenti.ru"]
-BYPASS_CIDRS = ["213.59.252.0/22", "109.207.0.0/18", "155.212.204.0/24", "185.169.155.0/24"]
+# Источник правды — БД (таблица bypass_exclusions, см. database.py). Здесь только
+# логика проверки дрейфа и формирования уведомлений.
 
 UPGRADE_INSTRUCTION = (
     "🔄 *Как обновить (новый ключ выдаётся автоматически):*\n"
@@ -23,17 +28,25 @@ UPGRADE_INSTRUCTION = (
     "3️⃣ Добавь новое одним из способов:\n"
     "   • *QR:* «＋» → «Сканировать QR-код» → наведи на новый QR;\n"
     "   • *Файл:* «＋» → «Импорт из файла» → выбери новый `.conf`.\n"
-    "4️⃣ Включи VPN. Готово — Госуслуги, MAX и банки заработают."
+    "4️⃣ Включи VPN. Готово — сервисы из списка ниже заработают."
 )
 
-def _check_bypass_drift():
-    """Синхронно: резолвит проблемные домены и проверяет, что их IP всё ещё внутри
-    BYPASS_CIDRS. Возвращает список 'ушедших' адресов (drift)."""
-    nets = [ipaddress.ip_network(c) for c in BYPASS_CIDRS]
+def _check_bypass_drift(entries):
+    """Синхронно: резолвит домены исключений и проверяет, что их IP всё ещё внутри
+    заявленных подсетей. entries: список (domain, [cidr, ...]). Возвращает список
+    'ушедших' адресов (drift)."""
     drifted = []
-    for d in BYPASS_DOMAINS:
+    for domain, cidrs in entries:
+        nets = []
+        for c in cidrs:
+            try:
+                nets.append(ipaddress.ip_network(c))
+            except ValueError:
+                continue
+        if not nets:
+            continue
         try:
-            infos = socket.getaddrinfo(d, 443, socket.AF_INET)
+            infos = socket.getaddrinfo(domain, 443, socket.AF_INET)
             ips = sorted({i[4][0] for i in infos})
         except Exception:
             continue
@@ -43,8 +56,56 @@ def _check_bypass_drift():
             except ValueError:
                 continue
             if not any(addr in n for n in nets):
-                drifted.append(f"{d} → {ip}")
+                drifted.append(f"{domain} → {ip}")
     return drifted
+
+async def _bypass_drift_entries():
+    """Готовит (domain, [cidr,...]) из БД для проверки дрейфа."""
+    rows = await db.get_bypass_exclusions()
+    return [(r['domain'], [c.strip() for c in (r['cidrs'] or '').split(',') if c.strip()]) for r in rows]
+
+
+def _config_is_split_tunnel(name):
+    """Определяет по выданному .conf, применён ли split-tunnel (обход), читая AllowedIPs.
+    Полный туннель содержит '0.0.0.0/0', split-tunnel — раздробленные подсети без него.
+    Возвращает True/False, либо None если файл не найден (судить не можем)."""
+    for fn in (f"{name}.conf", f"{name}_Full.conf", f"{name}_Smart.conf"):
+        p = CONFIGS_DIR / fn
+        if p.exists():
+            try:
+                txt = p.read_text()
+            except Exception:
+                continue
+            m = re.search(r"AllowedIPs\s*=\s*(.+)", txt)
+            if m:
+                return "0.0.0.0/0" not in m.group(1)
+    return None
+
+
+async def reconcile_routing_versions():
+    """Одноразовая сверка при старте: чинит ключи, которые УЖЕ были перевыпущены до
+    фикса бага (routing_version записался как 0), хотя их конфиг по факту содержит
+    split-tunnel. Такие ключи иначе бесконечно получали бы напоминания о перевыпуске.
+    Настоящие старые ключи (полный туннель) остаются на 0 и продолжают получать
+    напоминания — это корректно."""
+    try:
+        rows = await db.fetch_all("SELECT uuid, name, COALESCE(routing_version,0) AS rv FROM users")
+    except Exception as e:
+        print(f"reconcile_routing_versions: {e}")
+        return 0
+
+    fixed = 0
+    for r in rows:
+        if r['rv'] >= ROUTING_VERSION:
+            continue
+        is_split = await asyncio.to_thread(_config_is_split_tunnel, r['name'])
+        if is_split is True:
+            await db.execute("UPDATE users SET routing_version=$1 WHERE uuid=$2", ROUTING_VERSION, r['uuid'])
+            fixed += 1
+    if fixed:
+        await db.log_event("Routing", f"Reconciled routing_version for {fixed} already-reissued key(s).")
+        print(f"✅ Реконсиляция: проставлена актуальная routing_version у {fixed} уже-перевыпущенных ключей.")
+    return fixed
 
 notified_cache = set()
 last_ip_cache = {}
@@ -84,10 +145,11 @@ async def get_dashboard():
     except Exception:
         pass
 
-    bypass_count = len(BYPASS_CIDRS)
     try:
-        outdated_count = len(await db.get_outdated_keys(ROUTING_VERSION))
+        bypass_count = len(await db.get_all_bypass_cidrs())
+        outdated_count = len(await db.get_outdated_keys(await db.get_routing_version()))
     except Exception:
+        bypass_count = 0
         outdated_count = 0
 
     return (
@@ -496,22 +558,32 @@ async def routing_upgrade_loop(app):
             await asyncio.sleep(600)
 
 async def _send_upgrade_notices(app):
-    outdated = await db.get_outdated_keys(ROUTING_VERSION)
+    current_version = await db.get_routing_version()
+    outdated = await db.get_outdated_keys(current_version)
+    rows = await db.get_bypass_exclusions()
+    domains = ", ".join(f"`{escape_md(r['domain'])}`" for r in rows) if rows else "—"
     sent = 0
     for k in outdated:
         name = escape_md(k['name'])
         text = (
             f"🔔 **Обновите конфиг ключа «{name}»**\n\n"
-            "Хотите, чтобы **Госуслуги**, мессенджер **MAX**, банки и подобные сайты "
-            "работали через VPN? Перевыпустите этот конфиг. Старый продолжит работать "
-            "как прежде, но без обхода этих сервисов.\n\n" + UPGRADE_INSTRUCTION
+            "Перевыпустите конфиг, чтобы получить прямой доступ (мимо VPN) к сервисам, "
+            "которые блокируют дата-центры:\n"
+            f"{domains}\n\n"
+            "Старый ключ продолжит работать как прежде, но без обхода этих сервисов.\n\n"
+            + UPGRADE_INSTRUCTION + "\n\n" + GOSUSLUGI_APP_WARNING
         )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Перевыпустить этот ключ", callback_data=f"client_regen_{k['uuid']}")],
+            [InlineKeyboardButton("🌐 Список исключений", callback_data="client_bypass_info")],
+            [InlineKeyboardButton("🔕 Не напоминать", callback_data="client_notify_off")],
             [InlineKeyboardButton("🏠 Личный кабинет", callback_data="client_menu")],
         ])
         for tid in k.get('tg_ids', []):
             try:
+                # Уважаем персональный opt-out: пользователь мог сам отключить напоминания
+                if not await db.get_routing_notify(tid):
+                    continue
                 await app.bot.send_message(chat_id=tid, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
                 sent += 1
             except Exception:
@@ -521,10 +593,12 @@ async def _send_upgrade_notices(app):
     return sent
 
 async def _run_drift_alert(app):
-    drifted = await asyncio.to_thread(_check_bypass_drift)
+    entries = await _bypass_drift_entries()
+    drifted = await asyncio.to_thread(_check_bypass_drift, entries)
     if drifted and ADMIN_ID:
-        msg = ("⚠️ **Дрейф bypass-адресов!**\n\nIP проблемных сайтов вышли за пределы "
-               "BYPASS\\_CIDRS — обнови списки в `ru_wg_api/api.py` и `bot/monitor.py`:\n\n" +
+        msg = ("⚠️ **Дрейф адресов исключений!**\n\nIP сервисов вышли за пределы "
+               "заявленных подсетей — обнови их в админке: 🇷🇺 Управление RU → "
+               "🌐 Исключения (split-tunnel):\n\n" +
                "\n".join(f"• `{d}`" for d in drifted))
         try:
             await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
@@ -536,26 +610,29 @@ async def _run_drift_alert(app):
 # --- Ручной запуск из админки ---
 async def run_bypass_check_handler(update, context):
     query = update.callback_query
-    await query.answer("Проверяю bypass-адреса...")
+    await query.answer("Проверяю адреса исключений...")
     try:
-        drifted = await asyncio.to_thread(_check_bypass_drift)
-        outdated = await db.get_outdated_keys(ROUTING_VERSION)
+        entries = await _bypass_drift_entries()
+        drifted = await asyncio.to_thread(_check_bypass_drift, entries)
+        cidrs_count = len(await db.get_all_bypass_cidrs())
+        outdated = await db.get_outdated_keys(await db.get_routing_version())
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка проверки: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]))
         return
 
     lines = [
-        "🛡 **Проверка split-tunnel (bypass)**\n",
-        f"🚫 Bypass-диапазонов (мимо VPN): **{len(BYPASS_CIDRS)}**",
+        "🛡 **Проверка split-tunnel (исключения)**\n",
+        f"🚫 Подсетей-исключений (мимо VPN): **{cidrs_count}**",
         f"♻️ Ключей на старом формате: **{len(outdated)}**\n",
     ]
     if drifted:
-        lines.append("⚠️ **Дрейф IP — обнови списки в коде:**")
+        lines.append("⚠️ **Дрейф IP — обнови подсети в админке:**")
         lines += [f"• `{d}`" for d in drifted]
     else:
-        lines.append("✅ Все проблемные сайты в пределах bypass-диапазонов.")
+        lines.append("✅ Все сервисы в пределах заявленных подсетей.")
 
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Список исключений", callback_data="bypass_list")],
         [InlineKeyboardButton("📨 Разослать напоминания сейчас", callback_data="bypass_notify_now")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")],
     ])
@@ -569,3 +646,82 @@ async def bypass_notify_now_handler(update, context):
         f"✅ Напоминания разосланы по устаревшим ключам (сообщений: {sent}).",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]])
     )
+
+# ------------------------ УПРАВЛЕНИЕ ИСКЛЮЧЕНИЯМИ (АДМИН) ------------------------
+async def bypass_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rows = await db.get_bypass_exclusions()
+    rv = await db.get_routing_version()
+
+    lines = [
+        f"🌐 **Исключения split-tunnel** (версия маршрутизации: `{rv}`)\n",
+        "Эти подсети идут мимо VPN (через домашний канал клиента). При любом изменении "
+        "списка версия поднимается, и пользователям уходит напоминание о перевыпуске.\n",
+    ]
+    kb = []
+    if rows:
+        for r in rows:
+            note = f" — {escape_md(r['note'])}" if r['note'] else ""
+            lines.append(f"• `{escape_md(r['domain'])}`{note}\n  `{r['cidrs']}`")
+            kb.append([InlineKeyboardButton(f"🗑 {r['domain']}", callback_data=f"bypass_del_{r['id']}")])
+    else:
+        lines.append("_Список пуст._")
+
+    kb.append([InlineKeyboardButton("➕ Добавить вручную", callback_data="bypass_add_manual")])
+    kb.append([InlineKeyboardButton("📨 Напомнить о перевыпуске", callback_data="bypass_notify_now")])
+    kb.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
+    await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+async def bypass_del_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, exid: str):
+    query = update.callback_query
+    new_v = await db.remove_bypass_exclusion(exid)
+    await db.log_event("Routing", f"Bypass exclusion removed (id={exid}); routing -> v{new_v}.")
+    await query.answer(f"Удалено. Версия маршрутизации: {new_v}.")
+    await bypass_list_handler(update, context)
+
+async def bypass_add_manual_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["state"] = "awaiting_bypass_add"
+    kb = [[InlineKeyboardButton("🔙 Отмена", callback_data="bypass_list")]]
+    await query.edit_message_text(
+        "➕ **Добавить исключение**\n\nПришлите домен или ссылку (например, `mos.ru` "
+        "или `https://lk.gosuslugi.ru`). Я разрешу адрес в IP и добавлю его подсети (/24) "
+        "в обход VPN.",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN
+    )
+
+async def bypass_add_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, req_id: str, approve: bool = True):
+    query = update.callback_query
+    req = await db.get_bypass_request(req_id)
+    if not req:
+        await query.answer("Заявка не найдена.", show_alert=True)
+        return
+    if req['status'] != 'pending':
+        await query.answer(f"Заявка уже обработана ({req['status']}).", show_alert=True)
+        return
+
+    if approve:
+        cidrs = [c.strip() for c in (req['cidrs'] or '').split(',') if c.strip()]
+        new_v = await db.add_bypass_exclusion(req['domain'], cidrs, note="по заявке клиента", source="client")
+        await db.set_bypass_request_status(req_id, "approved")
+        await db.log_event("Routing", f"Bypass exclusion added by request: {req['domain']} -> v{new_v}.")
+        await query.edit_message_text(
+            f"✅ Добавлено в исключения: `{escape_md(req['domain'])}`\n"
+            f"Версия маршрутизации: `{new_v}` — клиентам уйдёт напоминание о перевыпуске.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        try:
+            await context.application.bot.send_message(
+                chat_id=req['tg_id'],
+                text=(f"✅ Сайт `{escape_md(req['domain'])}` добавлен в исключения!\n"
+                      "Перевыпустите ключ в «Мои ключи», чтобы доступ заработал."),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")]])
+            )
+        except Exception:
+            pass
+    else:
+        await db.set_bypass_request_status(req_id, "rejected")
+        await query.edit_message_text(f"❌ Заявка на `{escape_md(req['domain'])}` отклонена.", parse_mode=ParseMode.MARKDOWN)

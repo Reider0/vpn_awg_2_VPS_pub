@@ -6,9 +6,78 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
-from utils import escape_md, WG_API_URL, state_data, check_admin, CONFIGS_DIR, dt_to_moscow, ts_to_moscow, safe_delete, ROUTING_VERSION
+from utils import (
+    escape_md, WG_API_URL, state_data, check_admin, CONFIGS_DIR, dt_to_moscow,
+    ts_to_moscow, safe_delete, GOSUSLUGI_APP_WARNING
+)
 from database import db
 from wireguard_manager import create_peer, delete_peer
+
+# Сколько секунд старый ключ продолжает работать ПОСЛЕ выдачи нового конфига —
+# чтобы клиент успел импортировать новый и не остался без интернета во время замены.
+REGEN_GRACE_SECONDS = 45
+
+
+async def _issue_new_config(context, chat_id, user, deliver: bool = True):
+    """Перевыпуск ключа, ШАГ 1 (config-first): создаёт новый пир с актуальным набором
+    split-tunnel исключений, прописывает текущую routing_version и СНАЧАЛА выдаёт
+    клиенту новый конфиг + QR. Старый пир пока остаётся живым (его снимет _retire_old_peer
+    после grace-периода). Возвращает (old_uuid, name)."""
+    old_uuid = user['uuid']
+    name = user['name']
+    tg_ids = user.get('tg_ids', [])
+    exp_at = user.get('expires_at')
+
+    bypass_cidrs = await db.get_all_bypass_cidrs()
+    rv = await db.get_routing_version()
+
+    new_uid, c_path, q_path = await create_peer(name, dns_type="classic", bypass_cidrs=bypass_cidrs)
+    await db.execute(
+        "INSERT INTO users (name, uuid, created_at, expires_at, routing_version) VALUES ($1, $2, NOW(), $3, $4)",
+        name, new_uid, exp_at, rv
+    )
+    for tid in tg_ids:
+        await db.link_user_telegram(new_uid, tid)
+    await db.log_event("Client Regen", f"New config issued for {name} (routing v{rv}); old {old_uuid} pending retire.")
+
+    if deliver:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ **Новый конфиг ключа «{escape_md(name)}» готов!**\n\n"
+                f"📥 Импортируйте его в AmneziaWG *прямо сейчас*. Старый ключ продолжит "
+                f"работать ещё ~{REGEN_GRACE_SECONDS} сек — чтобы вы не остались без "
+                f"интернета во время замены."
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await context.bot.send_document(chat_id=chat_id, document=open(c_path, "rb"), caption=f"📄 {name}")
+        await context.bot.send_photo(chat_id=chat_id, photo=open(q_path, "rb"))
+
+    return old_uuid, name
+
+
+async def _retire_old_peer(old_uuid, name):
+    """Перевыпуск ключа, ШАГ 2: снимает СТАРЫЙ пир из ядра/конфига (файлы не трогаем —
+    на диске уже новый конфиг) и удаляет старую запись из БД. Запускается после
+    grace-периода."""
+    try:
+        await delete_peer(old_uuid, name, purge_files=False)
+    except Exception as e:
+        print(f"Retire old peer error ({name}/{old_uuid}): {e}")
+    await db.execute("DELETE FROM users WHERE uuid=$1", old_uuid)
+    await db.log_event("Client Regen", f"Old peer retired after grace: {name} ({old_uuid}).")
+
+
+def _schedule_retire(retire_list):
+    """Фоновая задача: ждёт grace-период и снимает старые пиры. Не блокирует хендлер."""
+    async def _finalize():
+        await asyncio.sleep(REGEN_GRACE_SECONDS)
+        for old_uuid, name in retire_list:
+            await _retire_old_peer(old_uuid, name)
+    task = asyncio.create_task(_finalize())
+    state_data.setdefault("bg_tasks", set()).add(task)
+    task.add_done_callback(state_data["bg_tasks"].discard)
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -90,7 +159,7 @@ async def send_client_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, fir
 
     text = f"👋 Привет, **{escape_md(first_name)}**!\n\nУ вас привязано ключей: **{len(keys)}**.\n"
     
-    keyboard = [[InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")],[InlineKeyboardButton("⚡️ Проверить соединение", callback_data="client_select_check")],[InlineKeyboardButton("📊 Моя статистика", callback_data="client_stats")],[InlineKeyboardButton("🆘 Сообщить о проблеме", callback_data="support_start")]
+    keyboard = [[InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")],[InlineKeyboardButton("⚡️ Проверить соединение", callback_data="client_select_check")],[InlineKeyboardButton("📊 Моя статистика", callback_data="client_stats")],[InlineKeyboardButton("🌐 Рос. сервисы (исключения)", callback_data="client_bypass_info")],[InlineKeyboardButton("🆘 Сообщить о проблеме", callback_data="support_start")]
     ]
     if check_admin(user_id):
         keyboard.append([InlineKeyboardButton("🚪 Выйти из режима клиента", callback_data="back_to_main")])
@@ -120,7 +189,7 @@ async def client_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = f"👋 Привет, **{escape_md(first_name)}**!\n\nУ вас привязано ключей: **{len(keys)}**.\n"
     
-    keyboard = [[InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")],[InlineKeyboardButton("⚡️ Проверить соединение", callback_data="client_select_check")],[InlineKeyboardButton("📊 Моя статистика", callback_data="client_stats")],[InlineKeyboardButton("🆘 Сообщить о проблеме", callback_data="support_start")]
+    keyboard = [[InlineKeyboardButton("🔑 Мои ключи", callback_data="client_my_keys")],[InlineKeyboardButton("⚡️ Проверить соединение", callback_data="client_select_check")],[InlineKeyboardButton("📊 Моя статистика", callback_data="client_stats")],[InlineKeyboardButton("🌐 Рос. сервисы (исключения)", callback_data="client_bypass_info")],[InlineKeyboardButton("🆘 Сообщить о проблеме", callback_data="support_start")]
     ]
     if check_admin(user_id):
         keyboard.append([InlineKeyboardButton("🚪 Выйти из режима клиента", callback_data="back_to_main")])
@@ -214,33 +283,33 @@ async def client_regen_all_action_handler(update: Update, context: ContextTypes.
         await query.edit_message_text("❌ У вас нет ключей.")
         return
         
-    await query.edit_message_text("⏳ Идет массовый перевыпуск ключей... Это займет некоторое время.")
-    
+    await query.edit_message_text(
+        "⏳ Готовлю новые конфиги для всех ключей…\n"
+        "Сначала выдам новые ключи, и только потом сниму старые — не выключайте VPN.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # config-first: сначала выдаём ВСЕ новые конфиги, копим старые пиры на снятие
+    retire_list = []
     for user in keys:
-        uuid_val = user['uuid']
-        name = user['name']
-        tg_ids = user.get('tg_ids',[])
-        exp_at = user.get('expires_at')
-        
-        await db.log_event("Client Regen All", f"User mass regenerated key: {name}")
-        await delete_peer(uuid_val, name)
-        await db.execute("DELETE FROM users WHERE uuid=$1", uuid_val)
-        
         try:
-            new_uid, c_path, q_path = await create_peer(name, dns_type="classic")
-            await db.execute("INSERT INTO users (name, uuid, created_at, expires_at, routing_version) VALUES ($1, $2, NOW(), $3, $4)", name, new_uid, exp_at, ROUTING_VERSION)
-            
-            for tid in tg_ids:
-                await db.link_user_telegram(new_uid, tid)
-                
-            await context.bot.send_message(chat_id=chat_id, text=f"✅ **Ключ {escape_md(name)} успешно перевыпущен!**", parse_mode=ParseMode.MARKDOWN)
-            await context.bot.send_document(chat_id=chat_id, document=open(c_path, "rb"), caption=f"📄 {name}")
-            await context.bot.send_photo(chat_id=chat_id, photo=open(q_path, "rb"))
+            retire_list.append(await _issue_new_config(context, chat_id, user))
         except Exception as e:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка перевыпуска ключа {escape_md(name)}: {e}")
-            
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка перевыпуска ключа {escape_md(user['name'])}: {e}")
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"✅ Новые конфиги выданы. Старые ключи будут отключены через "
+            f"~{REGEN_GRACE_SECONDS} сек — успейте импортировать новые в AmneziaWG."
+        ),
+        parse_mode=ParseMode.MARKDOWN
+    )
     await safe_delete(context, chat_id, query.message.message_id)
-    await client_my_keys_handler(update, context, send_new=True)
+
+    # снятие старых пиров — в фоне, после grace-периода
+    if retire_list:
+        _schedule_retire(retire_list)
 
 # --- НОВОЕ МЕНЮ ПРОВЕРКИ ---
 
@@ -417,30 +486,22 @@ async def client_regen_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Ключ не найден.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data="client_menu")]]))
         return
         
-    await query.edit_message_text("⏳ Удаляем старый и генерируем новый ключ...")
-    name = user['name']
-    tg_ids = user.get('tg_ids',[])
-    exp_at = user.get('expires_at')
-    
-    await db.log_event("Client Regen", f"User regenerated key: {name}")
-    await delete_peer(uuid_val, name)
-    await db.execute("DELETE FROM users WHERE uuid=$1", uuid_val)
-    
+    await query.edit_message_text(
+        f"⏳ Готовлю новый конфиг…\n"
+        f"Сначала выдам новый ключ, и только спустя ~{REGEN_GRACE_SECONDS} сек сниму "
+        f"старый — чтобы вы не остались без интернета. Не выключайте VPN.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # config-first: выдаём новый конфиг, старый пир снимаем в фоне после grace
     try:
-        new_uid, c_path, q_path = await create_peer(name, dns_type="classic")
-        await db.execute("INSERT INTO users (name, uuid, created_at, expires_at) VALUES ($1, $2, NOW(), $3)", name, new_uid, exp_at)
-        
-        for tid in tg_ids:
-            await db.link_user_telegram(new_uid, tid)
-            
-        await context.bot.send_message(chat_id=chat_id, text=f"✅ **Ключ успешно перевыпущен!**\nВот ваш новый файл конфигурации:", parse_mode=ParseMode.MARKDOWN)
-        await context.bot.send_document(chat_id=chat_id, document=open(c_path, "rb"), caption=f"📄 {name}")
-        await context.bot.send_photo(chat_id=chat_id, photo=open(q_path, "rb"))
-        
-        await safe_delete(context, chat_id, query.message.message_id)
-        await client_my_keys_handler(update, context, send_new=True)
+        retire = await _issue_new_config(context, chat_id, user)
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка перевыпуска: {e}")
+        return
+
+    await safe_delete(context, chat_id, query.message.message_id)
+    _schedule_retire([retire])
 
 async def support_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -540,5 +601,64 @@ async def support_ask_msg_handler(update: Update, context: ContextTypes.DEFAULT_
     
     keyboard = [[InlineKeyboardButton("🔙 Отмена", callback_data="client_menu")]]
     text = "📝 **Опишите вашу проблему:**\n\nНапишите одним сообщением, что именно не работает (например, 'не грузится инстаграм на wifi').\n\nЭто сообщение вместе с логами диагностики будет отправлено администратору."
-    
+
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+
+# --- SPLIT-TUNNEL: просмотр исключений и заявка на неработающий сайт (клиент) ---
+
+async def client_bypass_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rows = await db.get_bypass_exclusions()
+
+    lines = [
+        "🌐 **Доступ к российским сервисам (split-tunnel)**\n",
+        "Эти ресурсы блокируют IP дата-центров, поэтому идут *напрямую* мимо VPN — "
+        "так они снова работают (доступ открывается после перевыпуска ключа):\n",
+    ]
+    if rows:
+        for r in rows:
+            note = f" — {escape_md(r['note'])}" if r['note'] else ""
+            lines.append(f"• `{escape_md(r['domain'])}`{note}")
+    else:
+        lines.append("_Список пуст._")
+    lines.append("\n" + GOSUSLUGI_APP_WARNING)
+
+    enabled = await db.get_routing_notify(update.effective_user.id)
+    notify_label = "🔔 Напоминания о политиках: ВКЛ" if enabled else "🔕 Напоминания о политиках: ВЫКЛ"
+    kb = [
+        [InlineKeyboardButton("📝 Сообщить о неработающем сайте", callback_data="client_report_site")],
+        [InlineKeyboardButton(notify_label, callback_data="client_notify_toggle")],
+        [InlineKeyboardButton("🔙 В меню", callback_data="client_menu")],
+    ]
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+
+async def client_notify_toggle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_state = await db.toggle_routing_notify(update.effective_user.id)
+    await update.callback_query.answer(
+        "🔔 Напоминания о смене политик включены" if new_state else "🔕 Напоминания отключены",
+        show_alert=False
+    )
+    await client_bypass_info_handler(update, context)
+
+async def client_notify_off_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Быстрое отключение прямо из текста уведомления (кнопка «Не напоминать»)."""
+    await db.set_routing_notify(update.effective_user.id, False)
+    await update.callback_query.answer(
+        "🔕 Готово — больше не буду напоминать о смене политик. Включить обратно можно в "
+        "«Рос. сервисы (исключения)».",
+        show_alert=True
+    )
+
+async def client_report_site_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    context.user_data["state"] = "awaiting_bypass_report"
+    kb = [[InlineKeyboardButton("🔙 Отмена", callback_data="client_bypass_info")]]
+    await query.edit_message_text(
+        "📝 **Какой ресурс не открывается?**\n\n"
+        "Пришлите ссылку или домен одним сообщением — например, `gosuslugi.ru` "
+        "или `https://lk.gosuslugi.ru`.\n\n"
+        "Я проанализирую адрес и передам администратору на добавление в исключения. "
+        "После добавления вам придёт уведомление с предложением перевыпустить ключ.",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN
+    )

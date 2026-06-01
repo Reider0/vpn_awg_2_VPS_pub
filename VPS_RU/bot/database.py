@@ -8,7 +8,7 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
-from utils import dt_to_moscow
+from utils import dt_to_moscow, BASE_BYPASS, ROUTING_VERSION
 
 CONFIGS_DIR = Path("/volumes/configs")
 WG_CONF_PATH = Path("/volumes/wireguard/wg0.conf")
@@ -93,8 +93,129 @@ class Database:
             if not res_rv:
                 await self.execute("ALTER TABLE users ADD COLUMN routing_version INTEGER DEFAULT 0;")
 
+            # --- SPLIT-TUNNEL: динамический список исключений (обход мимо VPN) ---
+            # Источник правды для split-tunnel. build_split_allowed_ips в api.py
+            # получает эти подсети при создании конфига; при любом изменении списка
+            # routing_version поднимается → все старые ключи становятся устаревшими.
+            await self.execute("""
+                CREATE TABLE IF NOT EXISTS bypass_exclusions (
+                    id SERIAL PRIMARY KEY,
+                    domain TEXT UNIQUE,
+                    cidrs TEXT,
+                    note TEXT,
+                    source TEXT DEFAULT 'manual',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            # Заявки клиентов на добавление неработающего ресурса в исключения
+            await self.execute("""
+                CREATE TABLE IF NOT EXISTS bypass_requests (
+                    id SERIAL PRIMARY KEY,
+                    domain TEXT,
+                    cidrs TEXT,
+                    tg_id BIGINT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            # Персональные настройки уведомлений (на уровне Telegram-аккаунта).
+            # routing_notify=FALSE → пользователь сам отключил напоминания о смене
+            # политик маршрутизации/исключений (перевыпуск конфига).
+            await self.execute("""
+                CREATE TABLE IF NOT EXISTS notify_prefs (
+                    tg_id BIGINT PRIMARY KEY,
+                    routing_notify BOOLEAN DEFAULT TRUE
+                );
+            """)
+            # Первичное наполнение базовым списком (дата-центро-враждебные РФ-сервисы)
+            existing = await self.fetch_val("SELECT COUNT(*) FROM bypass_exclusions")
+            if not existing:
+                for domain, cidrs, note in BASE_BYPASS:
+                    await self.execute(
+                        "INSERT INTO bypass_exclusions (domain, cidrs, note, source) VALUES ($1,$2,$3,'base') ON CONFLICT (domain) DO NOTHING",
+                        domain, cidrs, note
+                    )
+
         except Exception as e:
             print(f"Migration error: {e}")
+
+    # ------------------------ SPLIT-TUNNEL EXCLUSIONS ------------------------
+    async def get_bypass_exclusions(self):
+        return await self.fetch_all(
+            "SELECT id, domain, cidrs, note, source, created_at FROM bypass_exclusions ORDER BY created_at ASC"
+        )
+
+    async def get_all_bypass_cidrs(self):
+        """Плоский дедуплицированный список всех CIDR из исключений (для AllowedIPs)."""
+        rows = await self.fetch_all("SELECT cidrs FROM bypass_exclusions")
+        seen, res = set(), []
+        for r in rows:
+            for c in (r['cidrs'] or "").split(","):
+                c = c.strip()
+                if c and c not in seen:
+                    seen.add(c)
+                    res.append(c)
+        return res
+
+    async def add_bypass_exclusion(self, domain, cidrs, note="", source="manual"):
+        cidrs_str = ",".join(cidrs) if isinstance(cidrs, (list, tuple)) else str(cidrs)
+        await self.execute(
+            "INSERT INTO bypass_exclusions (domain, cidrs, note, source) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (domain) DO UPDATE SET cidrs=$2, note=$3, source=$4",
+            domain, cidrs_str, note, source
+        )
+        return await self.bump_routing_version()
+
+    async def remove_bypass_exclusion(self, exid):
+        await self.execute("DELETE FROM bypass_exclusions WHERE id=$1", int(exid))
+        return await self.bump_routing_version()
+
+    async def add_bypass_request(self, domain, cidrs, tg_id):
+        cidrs_str = ",".join(cidrs) if isinstance(cidrs, (list, tuple)) else str(cidrs)
+        return await self.fetch_val(
+            "INSERT INTO bypass_requests (domain, cidrs, tg_id) VALUES ($1,$2,$3) RETURNING id",
+            domain, cidrs_str, tg_id
+        )
+
+    async def get_bypass_request(self, req_id):
+        rows = await self.fetch_all("SELECT id, domain, cidrs, tg_id, status FROM bypass_requests WHERE id=$1", int(req_id))
+        return rows[0] if rows else None
+
+    async def set_bypass_request_status(self, req_id, status):
+        await self.execute("UPDATE bypass_requests SET status=$1 WHERE id=$2", status, int(req_id))
+
+    async def get_routing_notify(self, tg_id):
+        """Включены ли у пользователя напоминания о смене политик. По умолчанию True."""
+        v = await self.fetch_val("SELECT routing_notify FROM notify_prefs WHERE tg_id=$1", tg_id)
+        return True if v is None else bool(v)
+
+    async def set_routing_notify(self, tg_id, enabled):
+        await self.execute(
+            "INSERT INTO notify_prefs (tg_id, routing_notify) VALUES ($1,$2) "
+            "ON CONFLICT (tg_id) DO UPDATE SET routing_notify=$2",
+            tg_id, bool(enabled)
+        )
+
+    async def toggle_routing_notify(self, tg_id):
+        new_state = not await self.get_routing_notify(tg_id)
+        await self.set_routing_notify(tg_id, new_state)
+        return new_state
+
+    async def get_routing_version(self):
+        """Текущая (эффективная) версия маршрутизации. Хранится в settings и не может
+        быть ниже базовой константы ROUTING_VERSION."""
+        v = await self.get_setting("routing_version")
+        try:
+            return max(int(v), ROUTING_VERSION) if v is not None else ROUTING_VERSION
+        except (TypeError, ValueError):
+            return ROUTING_VERSION
+
+    async def bump_routing_version(self):
+        """Поднимает версию маршрутизации на 1 → все ранее выданные ключи становятся
+        устаревшими и получат напоминание о перевыпуске."""
+        new = await self.get_routing_version() + 1
+        await self.set_setting("routing_version", str(new))
+        return new
 
     async def get_outdated_keys(self, current_version):
         """Ключи со старым форматом маршрутизации, у которых есть привязка Telegram —

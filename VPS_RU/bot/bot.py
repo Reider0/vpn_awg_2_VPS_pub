@@ -12,7 +12,8 @@ from telegram.constants import ParseMode
 
 from utils import (
     BOT_TOKEN, ADMIN_ID, WG_API_URL, DE_AGENT_URL, escape_md, state_data, stop_bg_tasks, deregister_menu,
-    safe_delete, get_current_version, broadcast_message, extract_tg_id, check_admin, sanitize_name
+    safe_delete, get_current_version, broadcast_message, extract_tg_id, check_admin, sanitize_name,
+    analyze_resource
 )
 from database import db
 from ui import main_menu
@@ -20,7 +21,9 @@ from monitor import (
     alert_loop, cleanup_peers, stats_collector_loop, self_healing_loop,
     expiration_loop, inactivity_loop, weekly_report_loop, log_cleanup_loop,
     auto_reboot_loop, scheduled_update_loop, resource_monitor_loop,
-    routing_upgrade_loop, run_bypass_check_handler, bypass_notify_now_handler
+    routing_upgrade_loop, run_bypass_check_handler, bypass_notify_now_handler,
+    bypass_list_handler, bypass_del_handler, bypass_add_manual_handler, bypass_add_request_handler,
+    reconcile_routing_versions
 )
 from wireguard_manager import pause_peer, resume_peer
 
@@ -28,7 +31,8 @@ from handlers_client import (
     client_menu, send_client_menu, check_connection_handler, client_stats_handler, 
     client_regen_confirm, client_regen_action, support_start_handler, support_run_audit_handler, 
     support_ask_msg_handler, client_download_handler, client_select_check_menu, client_check_all_handler,
-    client_my_keys_handler, client_key_manage_handler, client_regen_all_confirm_handler, client_regen_all_action_handler
+    client_my_keys_handler, client_key_manage_handler, client_regen_all_confirm_handler, client_regen_all_action_handler,
+    client_bypass_info_handler, client_report_site_handler, client_notify_toggle_handler, client_notify_off_handler
 )
 from handlers_admin import (
     return_to_main_menu, update_persistent_backup, start_dashboard, confirm_reboot, do_reboot_server, 
@@ -235,14 +239,79 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = None
         if chat_id in state_data["support_context"]:
             del state_data["support_context"][chat_id]
-        
+
+        await client_menu(update, context)
+        return
+
+    if state == "awaiting_bypass_report":
+        target = update.message.text or ""
+        context.user_data["state"] = None
+        res = await asyncio.to_thread(analyze_resource, target)
+
+        if res["error"] or not res["cidrs"]:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Не удалось проанализировать «{escape_md(target)}»: {escape_md(res.get('error') or 'адрес не разрешился')}.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await client_menu(update, context)
+            return
+
+        req_id = await db.add_bypass_request(res["domain"], res["cidrs"], update.effective_user.id)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(f"✅ Принято! Адрес `{escape_md(res['domain'])}` ({len(res['cidrs'])} подсетей) "
+                  "отправлен администратору. После добавления вам придёт уведомление "
+                  "с предложением перевыпустить ключ."),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        if ADMIN_ID:
+            ips = ", ".join(res["ips"][:5])
+            cidrs = ", ".join(res["cidrs"])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Добавить в исключения", callback_data=f"bypass_addreq_{req_id}")],
+                [InlineKeyboardButton("❌ Отклонить", callback_data=f"bypass_rejreq_{req_id}")],
+            ])
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(f"🌐 **Заявка на исключение (split-tunnel)**\n\n"
+                          f"👤 От: `{update.effective_user.id}`\n"
+                          f"🔗 Домен: `{escape_md(res['domain'])}`\n"
+                          f"📡 IP: `{ips}`\n"
+                          f"📦 Подсети: `{cidrs}`\n\n"
+                          "Добавить в обход VPN?"),
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+                )
+            except Exception:
+                pass
         await client_menu(update, context)
         return
 
     if not check_admin(update.effective_user.id): return
     await safe_delete(context, chat_id, user_msg_id)
-    
+
     # ---------------- ОБРАБОТЧИКИ АДМИНА ----------------
+    if state == "awaiting_bypass_add":
+        target = update.message.text or ""
+        context.user_data["state"] = None
+        res = await asyncio.to_thread(analyze_resource, target)
+        if res["error"] or not res["cidrs"]:
+            kb = [[InlineKeyboardButton("🌐 К списку исключений", callback_data="bypass_list")]]
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Не удалось: {escape_md(res.get('error') or 'адрес не разрешился')}", reply_markup=InlineKeyboardMarkup(kb))
+            return
+        new_v = await db.add_bypass_exclusion(res["domain"], res["cidrs"], note="добавлено вручную", source="manual")
+        await db.log_event("Routing", f"Bypass exclusion added manually: {res['domain']} -> v{new_v}.")
+        kb = [[InlineKeyboardButton("🌐 К списку исключений", callback_data="bypass_list")]]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(f"✅ Добавлено: `{escape_md(res['domain'])}`\n"
+                  f"Подсети: `{', '.join(res['cidrs'])}`\n"
+                  f"Версия маршрутизации: `{new_v}` — пользователям уйдёт напоминание о перевыпуске."),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+
     if state == "awaiting_schedule_time":
         time_str = update.message.text.strip()
         menu_id = context.user_data.get("menu_msg_id")
@@ -380,6 +449,10 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("check_conn_"): await check_connection_handler(update, context, data.replace("check_conn_", "")); return
     
     if data == "client_stats": await client_stats_handler(update, context); return
+    if data == "client_bypass_info": await client_bypass_info_handler(update, context); return
+    if data == "client_report_site": await client_report_site_handler(update, context); return
+    if data == "client_notify_toggle": await client_notify_toggle_handler(update, context); return
+    if data == "client_notify_off": await client_notify_off_handler(update, context); return
     if data.startswith("client_download_"): await client_download_handler(update, context, data.split("client_download_")[1]); return
     
     if data.startswith("client_regen_"): await client_regen_confirm(update, context, data.split("client_regen_")[1]); return
@@ -408,6 +481,12 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ Предупреждение успешно разослано.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data="back_to_main")]]))
         return
         
+    if data == "bypass_list": await bypass_list_handler(update, context); return
+    if data == "bypass_add_manual": await bypass_add_manual_handler(update, context); return
+    if data.startswith("bypass_del_"): await bypass_del_handler(update, context, data.split("bypass_del_")[1]); return
+    if data.startswith("bypass_addreq_"): await bypass_add_request_handler(update, context, data.split("bypass_addreq_")[1], approve=True); return
+    if data.startswith("bypass_rejreq_"): await bypass_add_request_handler(update, context, data.split("bypass_rejreq_")[1], approve=False); return
+
     if data == "support_admin_menu": await support_admin_menu(update, context); return
     if data.startswith("supp_usr_"): await support_user_tickets(update, context, data.split("supp_usr_")[1]); return
     if data.startswith("supp_tkt_"): await support_ticket_detail(update, context, data.split("supp_tkt_")[1]); return
@@ -497,9 +576,12 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application):
     state_data.setdefault("bg_tasks", set())
-    
+
     await sync_wg_config()
-    
+
+    # Чиним ключи, перевыпущенные до фикса бага (routing_version=0 при свежем конфиге)
+    await reconcile_routing_versions()
+
     tasks =[
         asyncio.create_task(alert_loop(application)),
         asyncio.create_task(cleanup_peers()),

@@ -20,9 +20,12 @@ async def backup_wg_config():
     except Exception as e:
         print(f"Error backing up wg config: {e}")
 
-async def create_peer(name: str, dns_type: str = "classic"):
+async def create_peer(name: str, dns_type: str = "classic", bypass_cidrs=None):
+    payload = {"name": name, "dns_type": dns_type}
+    if bypass_cidrs:
+        payload["bypass_cidrs"] = list(bypass_cidrs)
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{WG_API_URL}/peers", json={"name": name, "dns_type": dns_type}) as resp:
+        async with session.post(f"{WG_API_URL}/peers", json=payload) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
                 raise Exception(f"Ошибка VPN-сервера: {error_text}")
@@ -57,12 +60,19 @@ async def resume_peer(uuid: str):
             if resp.status != 200: raise Exception("Ошибка API возобновления")
     await backup_wg_config()
 
-async def delete_peer(uuid: str, name: str):
+async def delete_peer(uuid: str, name: str, purge_files: bool = True):
+    """Удаляет пир из ядра/конфига WireGuard. При purge_files=False файлы конфига
+    на диске НЕ трогаются — это критично для перевыпуска (config-first): к моменту
+    удаления старого пира файлы {name}.conf/.png уже содержат НОВЫЙ конфиг."""
     async with aiohttp.ClientSession() as session:
         async with session.delete(f"{WG_API_URL}/peers/{uuid}") as resp:
             if resp.status not in [200, 404]:
                 error_text = await resp.text()
                 raise Exception(f"Ошибка удаления API: {error_text}")
+
+    if not purge_files:
+        await backup_wg_config()
+        return
 
     try:
         if (CONFIGS_DIR / f"{name}.conf").exists(): (CONFIGS_DIR / f"{name}.conf").unlink()
