@@ -322,7 +322,7 @@ async def alert_loop(app):
                         if user:
                             safe_name = escape_md(user['name'])
                             if not device_set:
-                                await db.execute("UPDATE users SET device=$1, first_connected_at=NOW() WHERE uuid=$2", uuid_val)
+                                await db.execute("UPDATE users SET device=$1, first_connected_at=NOW() WHERE uuid=$2", hostname, uuid_val)
                                 await db.log_event("Connection", f"First connection by {user['name']} from {hostname}")
                                 if ADMIN_ID: await app.bot.send_message(chat_id=ADMIN_ID, text=f"🎉 **Новое подключение!**\n\n👤 {safe_name}\n📱 `{hostname}`\n🆔 `{uuid_val}`", parse_mode="Markdown")
 

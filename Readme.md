@@ -498,6 +498,16 @@ vpn_awg_2_VPS/
 
 ## 🩹 Патчи
 
+### v4.6.4 — Фикс «первого подключения» (DB Execute Error)
+
+Давний латентный баг в `alert_loop`: запрос фиксации первого подключения
+`UPDATE users SET device=$1, first_connected_at=NOW() WHERE uuid=$2` вызывался с **одним**
+аргументом вместо двух → `DB Execute Error: the server expects 2 arguments for this query, 1 was passed`.
+Срабатывал только для активного ключа с `device IS NULL` (на свежей БД), поэтому на части
+серверов не проявлялся. Последствия: лог спамился ошибкой каждые 10с, `device`/`first_connected_at`
+не записывались, а уведомление «🎉 Новое подключение» не отправлялось (исключение прерывало ветку
+до отправки). Исправлено: передаётся `hostname` (сеть устройства) в `device=$1`.
+
 ### v4.6.3 — Авто-откат на зеркало pip (zero-config)
 
 Диагностика на реальном РФ-хостинге показала: `pypi.org` и `files.pythonhosted.org` живут за **Fastly**, и с части IP TCP/443 к Fastly **режется** (при этом ICMP/ping проходит — `ping -s 1472` до pypi ок, а `curl https://pypi.org` — таймаут). То есть дело не в MTU и не в скорости, а в блокировке Fastly. Простого `--timeout/--retries` тут мало.

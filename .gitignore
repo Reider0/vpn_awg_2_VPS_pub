@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Локальные артефакты/секреты (на всякий случай)
+*.log
+.env
+.env.local
