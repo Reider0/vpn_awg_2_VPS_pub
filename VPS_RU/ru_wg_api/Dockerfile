@@ -11,15 +11,15 @@ RUN apk add --no-cache \
     iputils \
     ipset
 
-# Устойчивость к медленному/флапающему доступу к pypi.org (частая беда РФ-хостингов):
-# дефолтный per-read таймаут pip = 15с, поднимаем до 120с и добавляем ретраи.
-# При полностью заблокированном pypi можно собрать через зеркало:
-#   docker compose build --build-arg PIP_INDEX_URL=https://mirror.yandex.ru/mirrors/pypi/simple/
-ARG PIP_INDEX_URL=https://pypi.org/simple/
+# Устойчивость к блокировке pypi.org/Fastly (частая беда РФ-хостингов: ICMP идёт,
+# а TCP/443 к Fastly режется -> ReadTimeout/ConnectTimeout). Сначала быстрый заход
+# на официальный PyPI; при недоступности автоматически откат на зеркало (aliyun,
+# мимо Fastly, доступно из РФ). Зеркало можно переопределить:
+#   docker compose build --build-arg PIP_MIRROR=<url-до-simple/>
+ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
 RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir --timeout 120 --retries 10 \
-        --index-url "$PIP_INDEX_URL" \
-        fastapi uvicorn pydantic
+    ( /opt/venv/bin/pip install --no-cache-dir --timeout 20 --retries 1 fastapi uvicorn pydantic \
+   || /opt/venv/bin/pip install --no-cache-dir --timeout 120 --retries 10 --index-url "$PIP_MIRROR" fastapi uvicorn pydantic )
 
 COPY update_ru_ips.sh /app/update_ru_ips.sh
 COPY run_api.sh /run_api.sh

@@ -16,13 +16,14 @@ RUN git config --global --add safe.directory '*' && \
     git config --global credential.helper ""
 
 COPY requirements.txt .
-# Устойчивость к медленному/флапающему pypi.org (см. ru_wg_api/Dockerfile).
-# Зеркало при необходимости:
-#   docker compose build --build-arg PIP_INDEX_URL=https://mirror.yandex.ru/mirrors/pypi/simple/
-ARG PIP_INDEX_URL=https://pypi.org/simple/
-RUN pip install --no-cache-dir --timeout 120 --retries 10 \
-        --index-url "$PIP_INDEX_URL" \
-        -r requirements.txt
+# Устойчивость к блокировке pypi.org/Fastly (частая беда РФ-хостингов: ICMP идёт,
+# а TCP/443 к Fastly режется -> ReadTimeout/ConnectTimeout). Сначала быстрый заход
+# на официальный PyPI; при недоступности автоматически откат на зеркало (aliyun,
+# мимо Fastly, доступно из РФ). Зеркало можно переопределить:
+#   docker compose build --build-arg PIP_MIRROR=<url-до-simple/>
+ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
+RUN pip install --no-cache-dir --timeout 20 --retries 1 -r requirements.txt \
+ || pip install --no-cache-dir --timeout 120 --retries 10 --index-url "$PIP_MIRROR" -r requirements.txt
 
 COPY . .
 

@@ -498,14 +498,20 @@ vpn_awg_2_VPS/
 
 ## 🩹 Патчи
 
-### v4.6.2 — Устойчивая сборка при медленном pypi
+### v4.6.3 — Авто-откат на зеркало pip (zero-config)
 
-Сборка образов падала на флапающем доступе к `pypi.org` (`ReadTimeoutError`, дефолтный per-read таймаут pip = 15с) — частая беда РФ-хостингов. Теперь оба `Dockerfile` ставят зависимости с `--timeout 120 --retries 10`, а через build-arg можно указать зеркало:
+Диагностика на реальном РФ-хостинге показала: `pypi.org` и `files.pythonhosted.org` живут за **Fastly**, и с части IP TCP/443 к Fastly **режется** (при этом ICMP/ping проходит — `ping -s 1472` до pypi ок, а `curl https://pypi.org` — таймаут). То есть дело не в MTU и не в скорости, а в блокировке Fastly. Простого `--timeout/--retries` тут мало.
+
+Теперь сборка **сама** разбирается без ручных флагов: сначала быстрый заход на официальный PyPI (`--timeout 20 --retries 1` — быстрый фейл при блокировке), при неудаче — автоматический откат на зеркало **aliyun** (`mirrors.aliyun.com`, мимо Fastly, доступно из РФ). На хостах с доступным pypi берётся pypi, на заблокированных — зеркало. Зеркало переопределяется:
 
 ```bash
-docker compose build --build-arg PIP_INDEX_URL=https://mirror.yandex.ru/mirrors/pypi/simple/
+docker compose build --build-arg PIP_MIRROR=https://<свой-mirror>/simple/
 docker compose up -d
 ```
+
+### v4.6.2 — Устойчивая сборка при медленном pypi
+
+Сборка образов падала на флапающем доступе к `pypi.org` (`ReadTimeoutError`, дефолтный per-read таймаут pip = 15с). Поднят `--timeout 120 --retries 10` (в v4.6.3 заменено на авто-откат на зеркало).
 
 ### v4.6.1 — Персональное отключение напоминаний
 
