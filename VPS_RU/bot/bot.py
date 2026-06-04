@@ -6,7 +6,10 @@ import os
 import json
 import time
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat, MenuButtonCommands
+)
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
@@ -32,7 +35,8 @@ from handlers_client import (
     client_regen_confirm, client_regen_action, support_start_handler, support_run_audit_handler, 
     support_ask_msg_handler, client_download_handler, client_select_check_menu, client_check_all_handler,
     client_my_keys_handler, client_key_manage_handler, client_regen_all_confirm_handler, client_regen_all_action_handler,
-    client_bypass_info_handler, client_report_site_handler, client_notify_toggle_handler, client_notify_off_handler
+    client_bypass_info_handler, client_report_site_handler, client_notify_toggle_handler, client_notify_off_handler,
+    cmd_keys, cmd_status, cmd_support, cmd_help
 )
 from handlers_admin import (
     return_to_main_menu, update_persistent_backup, start_dashboard, confirm_reboot, do_reboot_server, 
@@ -574,9 +578,34 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in actions: await actions[data](update, context)
     else: await query.answer("...")
 
+async def setup_bot_ui(application):
+    """Нативный UI Telegram: кнопка-меню ☰ + список slash-команд (раздельно для
+    клиентов и админа)."""
+    client_cmds = [
+        BotCommand("start", "🏠 Главное меню"),
+        BotCommand("keys", "🔑 Мои ключи и конфиги"),
+        BotCommand("status", "⚡️ Проверить соединение"),
+        BotCommand("support", "🆘 Сообщить о проблеме"),
+        BotCommand("help", "❓ Помощь"),
+    ]
+    try:
+        await application.bot.set_my_commands(client_cmds, scope=BotCommandScopeDefault())
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        if ADMIN_ID:
+            admin_cmds = [
+                BotCommand("start", "🛡 Панель управления"),
+                BotCommand("keys", "🔑 Мои ключи"),
+                BotCommand("status", "⚡️ Проверить соединение"),
+                BotCommand("help", "❓ Помощь"),
+            ]
+            await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(ADMIN_ID))
+    except Exception as e:
+        print(f"setup_bot_ui error: {e}")
+
 async def post_init(application):
     state_data.setdefault("bg_tasks", set())
 
+    await setup_bot_ui(application)
     await sync_wg_config()
 
     # Чиним ключи, перевыпущенные до фикса бага (routing_version=0 при свежем конфиге)
@@ -608,6 +637,11 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     
     app.add_handler(CommandHandler("start", start))
+    # Нативные slash-команды (регистрируем ДО общего обработчика команд)
+    app.add_handler(CommandHandler("keys", cmd_keys))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("support", cmd_support))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.Document.ALL, restore_file_handler))
     app.add_handler(MessageHandler(~filters.COMMAND & ~filters.Document.ALL, handle_message))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))

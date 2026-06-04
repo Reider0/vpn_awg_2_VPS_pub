@@ -157,14 +157,19 @@ class Database:
                     res.append(c)
         return res
 
-    async def add_bypass_exclusion(self, domain, cidrs, note="", source="manual"):
+    async def add_bypass_exclusion(self, domain, cidrs, note="", source="manual", bump=True):
+        """Добавляет/обновляет исключение. bump=True поднимает routing_version (все ключи
+        станут устаревшими → напоминание о перевыпуске). Для тихого авто-расширения при
+        дрейфе IP вызывать с bump=False."""
         cidrs_str = ",".join(cidrs) if isinstance(cidrs, (list, tuple)) else str(cidrs)
         await self.execute(
             "INSERT INTO bypass_exclusions (domain, cidrs, note, source) VALUES ($1,$2,$3,$4) "
             "ON CONFLICT (domain) DO UPDATE SET cidrs=$2, note=$3, source=$4",
             domain, cidrs_str, note, source
         )
-        return await self.bump_routing_version()
+        if bump:
+            return await self.bump_routing_version()
+        return await self.get_routing_version()
 
     async def remove_bypass_exclusion(self, exid):
         await self.execute("DELETE FROM bypass_exclusions WHERE id=$1", int(exid))

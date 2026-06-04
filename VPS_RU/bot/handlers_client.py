@@ -650,6 +650,48 @@ async def client_notify_off_handler(update: Update, context: ContextTypes.DEFAUL
         show_alert=True
     )
 
+# --- SLASH-КОМАНДЫ (нативное меню Telegram): входы новым сообщением ---
+
+async def cmd_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await client_my_keys_handler(update, context, send_new=True)
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    keys = await db.get_users_by_tg_id(user_id)
+    if not keys:
+        await context.bot.send_message(user_id, "❌ У вас нет привязанных ключей VPN.")
+        return
+    text = "⚡️ **Проверка соединения**\n\nВыберите ключ для диагностики или проверьте все сразу:"
+    keyboard = [[InlineKeyboardButton(f"🔎 {k['name']}", callback_data=f"check_conn_{k['uuid']}")] for k in keys]
+    keyboard.append([InlineKeyboardButton("🚀 Проверить все ключи", callback_data="client_check_all")])
+    keyboard.append([InlineKeyboardButton("🏠 Меню", callback_data="client_menu")])
+    await context.bot.send_message(user_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    keys = await db.get_users_by_tg_id(user_id)
+    if not keys:
+        await context.bot.send_message(user_id, "❌ У вас нет привязанных ключей VPN.")
+        return
+    text = "🆘 **Поддержка**\n\nВыберите ключ, с которым возникла проблема (запущу диагностику):"
+    keyboard = [[InlineKeyboardButton(f"🔑 {k['name']}", callback_data=f"support_audit_{k['uuid']}")] for k in keys]
+    keyboard.append([InlineKeyboardButton("🏠 Меню", callback_data="client_menu")])
+    await context.bot.send_message(user_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "❓ **Помощь**\n\n"
+        "🔑 /keys — ваши ключи: скачать конфиг, QR, перевыпустить\n"
+        "⚡️ /status — проверить, видит ли сервер ваше устройство\n"
+        "🆘 /support — сообщить о проблеме и запустить диагностику\n"
+        "🏠 /start — главное меню\n\n"
+        "ℹ️ *Как подключиться:* установите приложение **AmneziaWG**, добавьте конфиг "
+        "(по QR или из файла) и включите VPN.\n\n"
+        + GOSUSLUGI_APP_WARNING
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Меню", callback_data="client_menu")]])
+    await context.bot.send_message(update.effective_user.id, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
 async def client_report_site_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     context.user_data["state"] = "awaiting_bypass_report"

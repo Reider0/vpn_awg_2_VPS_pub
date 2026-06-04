@@ -56,7 +56,7 @@ def _check_bypass_drift(entries):
             except ValueError:
                 continue
             if not any(addr in n for n in nets):
-                drifted.append(f"{domain} → {ip}")
+                drifted.append((domain, ip))
     return drifted
 
 async def _bypass_drift_entries():
@@ -112,8 +112,22 @@ last_ip_cache = {}
 
 ghost_cache = {}
 paused_cache = {}
-flapping_cache = {}        
-resource_alert_cache = {}  
+flapping_cache = {}
+resource_alert_cache = {}
+
+# --- АНТИ-ШЕРИНГ: отличаем реальный шеринг от легитимной смены сети ---
+# Истинный шеринг = НЕСКОЛЬКО устройств онлайн ОДНОВРЕМЕННО: endpoint пира быстро
+# «пинг-понгует» между малым числом адресов и не затихает (каждое устройство шлёт
+# handshake каждые ~25с keepalive). Легитимное переключение (самолёт/Wi-Fi/моб.) даёт
+# лишь пару смен и успокаивается, либо идёт через РАЗНЫЕ сети.
+# Поэтому баним только при УСТОЙЧИВОЙ осцилляции между малым числом адресов.
+FLAP_WINDOW = 300          # окно наблюдения, сек
+FLAP_MIN_JUMPS = 8         # минимум смен адреса в окне (раньше было 3 — ловило легит-свитч)
+FLAP_MAX_DISTINCT = 3      # ...при этом всего <= стольких уникальных адресов (пинг-понг)
+
+# Авто-абсорбция дрейфа: верхний предел подсетей на один домен, чтобы авто-расширение
+# не раздуло AllowedIPs/QR (если сервис рассеян по многим IP — зовём админа вручную).
+MAX_CIDRS_PER_DOMAIN = 10
 
 # ------------------------ DASHBOARD ------------------------
 async def get_dashboard():
@@ -277,12 +291,16 @@ async def alert_loop(app):
                         prev_ip, prev_time = last_ip_cache.get(uuid_val, ("", 0))
                         
                         if hostname != prev_ip and prev_ip != "":
-                            jumps = flapping_cache.get(uuid_val, [])
-                            jumps.append(now)
-                            jumps = [t for t in jumps if (now - t) < 300]
-                            flapping_cache[uuid_val] = jumps
-                            
-                            if len(jumps) >= 3:
+                            events = flapping_cache.get(uuid_val, [])
+                            events.append((hostname, now))
+                            events = [(ip, t) for (ip, t) in events if (now - t) < FLAP_WINDOW]
+                            flapping_cache[uuid_val] = events
+
+                            distinct_ips = len({ip for ip, _ in events})
+                            # Бан ТОЛЬКО при устойчивом пинг-понге: много смен между малым
+                            # числом адресов (несколько устройств онлайн одновременно).
+                            # Легитимное переключение сети сюда не попадает.
+                            if len(events) >= FLAP_MIN_JUMPS and distinct_ips <= FLAP_MAX_DISTINCT:
                                 try:
                                     async with aiohttp.ClientSession() as session:
                                         await session.post(f"{WG_API_URL}/peers/{uuid_val}/pause")
@@ -293,7 +311,7 @@ async def alert_loop(app):
                                 
                                 if ADMIN_ID:
                                     safe_name = escape_md(user['name'])
-                                    alert_msg = f"🚨 **КЛЮЧ СКОМПРОМЕТИРОВАН!**\n\n👤 Пользователь: **{safe_name}**\n🔄 Более 3 смен сети за 5 минут.\n⛔️ **Ключ заморожен.**"
+                                    alert_msg = f"🚨 **КЛЮЧ СКОМПРОМЕТИРОВАН!**\n\n👤 Пользователь: **{safe_name}**\n🔄 Устойчивое переключение между {distinct_ips} адресами ({len(events)} смен за 5 мин) — похоже на одновременное использование на нескольких устройствах.\n⛔️ **Ключ заморожен.**"
                                     await app.bot.send_message(chat_id=ADMIN_ID, text=alert_msg, parse_mode="Markdown")
 
                                 tg_ids = user.get('tg_ids', [])
@@ -550,7 +568,7 @@ async def routing_upgrade_loop(app):
                 if await db.get_setting("last_routing_notice") != today:
                     await db.set_setting("last_routing_notice", today)
                     await _send_upgrade_notices(app)
-                    await _run_drift_alert(app)
+                    await _auto_absorb_drift(app)
             except Exception as e:
                 print(f"Routing upgrade loop error: {e}")
             await asyncio.sleep(3600)
@@ -592,28 +610,76 @@ async def _send_upgrade_notices(app):
         await db.log_event("Routing", f"Daily upgrade notice sent ({sent} msg).")
     return sent
 
-async def _run_drift_alert(app):
+async def _auto_absorb_drift(app=None):
+    """Сам сканирует адреса исключений и при дрейфе IP (адрес сервиса вышел за пределы
+    заявленных подсетей) АВТОМАТИЧЕСКИ добавляет новую /24 в нужный домен — без ручной
+    работы админа. bump=False: не поднимаем routing_version, чтобы не вызывать лавину
+    перевыпусков (новые/перевыпущенные ключи и так получат актуальный список).
+    Если домен рассеялся по многим IP (> MAX_CIDRS_PER_DOMAIN) — это уже не дрейф, а
+    смена инфраструктуры: тогда один раз зовём админа.
+    Возвращает (changed, overflow)."""
     entries = await _bypass_drift_entries()
-    drifted = await asyncio.to_thread(_check_bypass_drift, entries)
-    if drifted and ADMIN_ID:
-        msg = ("⚠️ **Дрейф адресов исключений!**\n\nIP сервисов вышли за пределы "
-               "заявленных подсетей — обнови их в админке: 🇷🇺 Управление RU → "
-               "🌐 Исключения (split-tunnel):\n\n" +
-               "\n".join(f"• `{d}`" for d in drifted))
+    drifted = await asyncio.to_thread(_check_bypass_drift, entries)  # [(domain, ip), ...]
+    if not drifted:
+        return [], []
+
+    # группируем новые /24 по домену
+    by_domain = {}
+    for domain, ip in drifted:
         try:
-            await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+            net = str(ipaddress.ip_network(f"{ip}/24", strict=False))
+        except ValueError:
+            continue
+        by_domain.setdefault(domain, set()).add(net)
+
+    rows = {r['domain']: r for r in await db.get_bypass_exclusions()}
+    changed, overflow = [], []
+    for domain, new_nets in by_domain.items():
+        r = rows.get(domain)
+        if not r:
+            continue
+        cur = [c.strip() for c in (r['cidrs'] or '').split(',') if c.strip()]
+        add = [n for n in sorted(new_nets) if n not in cur]
+        if not add:
+            continue
+        if len(cur) + len(add) > MAX_CIDRS_PER_DOMAIN:
+            overflow.append((domain, add))
+            continue
+        await db.add_bypass_exclusion(domain, cur + add, note=r['note'] or '', source=r['source'] or 'auto', bump=False)
+        changed.append((domain, add))
+
+    if changed:
+        await db.log_event("Routing", "Auto-absorbed bypass drift: " + "; ".join(f"{d}+{','.join(n)}" for d, n in changed))
+        if app and ADMIN_ID:
+            lines = ["🔄 **Исключения авто-обновлены (дрейф IP)**\n",
+                     "Сам добавил новые подсети — _действий не требуется_:"]
+            lines += [f"• `{escape_md(d)}` → `{', '.join(n)}`" for d, n in changed]
+            lines.append("\nНовые ключи получат их сразу; существующим — при следующем перевыпуске.")
+            try:
+                await app.bot.send_message(chat_id=ADMIN_ID, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
+
+    if overflow and app and ADMIN_ID:
+        await db.log_event("Routing", "Bypass drift overflow (manual review): " + "; ".join(d for d, _ in overflow))
+        lines = ["⚠️ **Сервис сменил инфраструктуру (нужен взгляд)**\n",
+                 f"Эти домены рассеялись по >{MAX_CIDRS_PER_DOMAIN} подсетям — авто-добавлять не стал, "
+                 "чтобы не раздуть конфиг/QR. Проверь в 🌐 Исключения:"]
+        lines += [f"• `{escape_md(d)}` → `{', '.join(n)}`" for d, n in overflow]
+        try:
+            await app.bot.send_message(chat_id=ADMIN_ID, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN)
         except Exception:
             pass
-        await db.log_event("Routing", f"Bypass drift detected: {len(drifted)} entries.")
-    return drifted
+
+    return changed, overflow
 
 # --- Ручной запуск из админки ---
 async def run_bypass_check_handler(update, context):
     query = update.callback_query
-    await query.answer("Проверяю адреса исключений...")
+    await query.answer("Сканирую и авто-обновляю адреса...")
     try:
-        entries = await _bypass_drift_entries()
-        drifted = await asyncio.to_thread(_check_bypass_drift, entries)
+        # ручной запуск делает то же, что и фоновый: сам абсорбирует дрейф
+        changed, overflow = await _auto_absorb_drift(app=None)
         cidrs_count = len(await db.get_all_bypass_cidrs())
         outdated = await db.get_outdated_keys(await db.get_routing_version())
     except Exception as e:
@@ -625,10 +691,13 @@ async def run_bypass_check_handler(update, context):
         f"🚫 Подсетей-исключений (мимо VPN): **{cidrs_count}**",
         f"♻️ Ключей на старом формате: **{len(outdated)}**\n",
     ]
-    if drifted:
-        lines.append("⚠️ **Дрейф IP — обнови подсети в админке:**")
-        lines += [f"• `{d}`" for d in drifted]
-    else:
+    if changed:
+        lines.append("🔄 **Авто-добавил подсети (дрейф IP):**")
+        lines += [f"• `{d}` → `{', '.join(n)}`" for d, n in changed]
+    if overflow:
+        lines.append("⚠️ **Рассеялись по многим IP — нужен ручной взгляд:**")
+        lines += [f"• `{d}`" for d, _ in overflow]
+    if not changed and not overflow:
         lines.append("✅ Все сервисы в пределах заявленных подсетей.")
 
     kb = InlineKeyboardMarkup([
